@@ -1,0 +1,3 @@
+# Third-party dependencies for simulator/. Justification: see
+# "Dependency choice" in simulator/README.md.
+pydantic>=2.4,<3

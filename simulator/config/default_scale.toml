@@ -1,0 +1,36 @@
+# Default scale configuration for the TransitPulse synthetic domain model.
+#
+# PROJECT.md section 5 target: ~50 vehicles, 10 routes, 100-200 stops,
+# 4 depots, realistic synthetic Sydney-area coordinates. Scale must be
+# config-driven rather than requiring redesign (section 19) — change the
+# values below (or pass a different TOML file to the loader) to rescale.
+
+seed = 42
+
+[counts]
+vehicle_count = 50
+route_count = 10
+stop_count = 150
+stop_count_min = 100
+stop_count_max = 200
+depot_count = 4
+
+# Approximate Greater Sydney metro bounding box used to constrain every
+# generated depot/stop coordinate (and, downstream, telemetry positions).
+[sydney_bounding_box]
+min_latitude = -34.05
+max_latitude = -33.55
+min_longitude = 150.55
+max_longitude = 151.35
+
+[fleet]
+min_vehicle_capacity = 40
+max_vehicle_capacity = 80
+
+[route_shape]
+min_stops_per_route = 8
+max_stops_per_route = 18
+
+[depot]
+min_capacity = 20
+max_capacity = 60

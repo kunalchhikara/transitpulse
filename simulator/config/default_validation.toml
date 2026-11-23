@@ -1,0 +1,33 @@
+# Default data-quality validation thresholds: PROJECT.md section 12.
+#
+# These govern what a Silver-layer validator (a later story, DE-06) accepts
+# vs quarantines. Keeping them here — rather than as constants inside
+# validation code — means thresholds can be tuned (e.g. to simulate a
+# stricter/looser quality gate) without touching source.
+
+[telemetry]
+max_speed_kmh = 120.0
+min_speed_kmh = 0.0
+max_occupancy = 150
+min_occupancy = 0
+min_heading_degrees = 0.0
+max_heading_degrees = 359.9
+future_time_tolerance_seconds = 120
+require_known_route = true
+supported_schema_versions = ["1.0.0"]
+required_fields = [
+    "event_id",
+    "schema_version",
+    "generated_at",
+    "event_time",
+    "vehicle_id",
+    "route_id",
+    "trip_id",
+    "latitude",
+    "longitude",
+    "speed_kmh",
+    "heading",
+    "occupancy",
+    "delay_seconds",
+    "status",
+]
