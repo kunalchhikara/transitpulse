@@ -228,7 +228,10 @@ idempotency/replay approach.
 metadata columns; re-running same run_id/input produces identical output or
 clearly-flagged duplicates per documented policy; works for both shapes.
 **Test requirements:** streaming-source test; batch-source test; idempotent-
-rerun test; malformed/truncated-input failure test (fails loudly).
+rerun test; malformed/truncated-input test proving such input is never
+silently dropped (as built: preserved with a typed parse-error marker by
+default; fail-loud available via the strict policy, also tested — decision
+recorded after QA of PR #9).
 **Security:** synthetic only; local file paths only.
 **Cost:** zero.
 **Documentation:** `simulator/README.md` Bronze contract; explicit
@@ -250,6 +253,12 @@ documented reconciliation identity.
 **Out of scope:** Gold aggregates (DE-07); Fabric Eventstream/watermark
 integration; Warehouse SQL.
 **Dependencies:** DE-05; DE-03 (incident-laced events as primary fixtures).
+**Bronze read contract (from QA of PR #9):** Silver reads Bronze only through
+committed run manifests (`BronzeStore.read_table` /
+`committed_partition_files`), never by globbing directories — a crashed run
+can leave orphan partitions on disk until its run_id is retried. Bronze
+parse-error records (`_bronze_parse_error`, raw line preserved) must be
+routed to quarantine, not dropped, and count in the reconciliation identity.
 **Acceptance criteria:** each DE-03 scenario produces the expected Silver
 outcome; run-summary counters reconcile exactly to total input; quarantine
 retains raw payload losslessly.
@@ -310,3 +319,14 @@ note prevents overclaiming, handover.
   can see the trip before the disruption. DE-05/DE-06 must not reject or
   drop such rows. Also: `event_date` is the *local* service date and must
   not be re-derived from UTC timestamps. Source: QA of PR #8 (DE-04).
+- **FU-03: Keep the audit trail of failed Bronze attempts.** Retrying a
+  failed run with the same run_id overwrites that run's FAILED manifest, so
+  the earlier error only survives in logs (weakens the §15 audit trail).
+  Add a `previous_attempts` history or one audit file per attempt. Source:
+  QA of PR #9 (DE-05).
+- **FU-04: Sanitise local paths before publishing any run manifest.** Bronze
+  run manifests record `input_files[].path` exactly as given, so an absolute
+  local path (including the OS username) can appear. Data records are
+  clean (basename only) and `simulator/_out/` is gitignored, but any
+  manifest copied into RECORDED/DEMO evidence or the website must be
+  sanitised first. Source: QA of PR #9 (DE-05).

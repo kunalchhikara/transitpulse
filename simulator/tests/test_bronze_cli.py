@@ -116,6 +116,9 @@ def test_default_config_values_and_validation():
         BronzeConfig.model_validate(data | {"unexpected": 1})
     with pytest.raises(ValidationError):
         BronzeConfig.model_validate(data | {"stream": {"source": "s", "table": "../x"}})
+    for reserved in ("_runs", "_staging"):
+        with pytest.raises(ValidationError):
+            BronzeConfig.model_validate(data | {"stream": {"source": "s", "table": reserved}})
     with pytest.raises(ValidationError):
         BronzeConfig.model_validate(
             data | {"batch": data["batch"] | {"record_source_template": "no-placeholder"}}

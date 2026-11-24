@@ -17,8 +17,10 @@ from pydantic import BaseModel, Field, field_validator
 DEFAULT_BRONZE_CONFIG_PATH = Path(__file__).parent / "default_bronze.toml"
 
 #: Table names become directory names in the local store, so they are
-#: restricted to a safe identifier alphabet (no separators, no `..`).
-TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+#: restricted to a safe identifier alphabet (no separators, no `..`). A
+#: leading underscore is reserved for store-internal directories (`_runs`,
+#: `_staging`), so a table can never shadow them or escape orphan cleanup.
+TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{0,63}$")
 
 
 class ParseErrorPolicy(str, Enum):

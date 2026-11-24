@@ -159,6 +159,26 @@ def test_unsafe_file_name_in_source_manifest_rejected(tmp_path):
         ingest_batch(batch_dir, run_id="unsafe", output_dir=tmp_path / "bronze", clock=FIXED_CLOCK)
 
 
+@pytest.mark.parametrize("reserved", ["_staging", "_runs", "_anything"])
+def test_reserved_dataset_name_in_source_manifest_rejected(tmp_path, reserved):
+    batch_dir = _copy_sample(tmp_path)
+    manifest = json.loads((batch_dir / "manifest.json").read_text())
+    manifest["datasets"][reserved] = manifest["datasets"].pop("schedules")
+    (batch_dir / "manifest.json").write_text(json.dumps(manifest))
+    out = tmp_path / "bronze"
+    with pytest.raises(InputError, match="unsafe"):
+        ingest_batch(batch_dir, run_id="reserved", output_dir=out, clock=FIXED_CLOCK)
+    assert not (out / reserved / "run_id=reserved").exists()
+
+
+def test_reserved_dataset_name_from_file_stem_rejected(tmp_path):
+    batch_dir = _copy_sample(tmp_path)
+    (batch_dir / "manifest.json").unlink()
+    (batch_dir / "schedules.jsonl").rename(batch_dir / "_staging.jsonl")
+    with pytest.raises(InputError, match="unsafe"):
+        ingest_batch(batch_dir, run_id="reserved", output_dir=tmp_path / "bronze", clock=FIXED_CLOCK)
+
+
 def test_empty_dataset_file_is_committed_as_empty_table(tmp_path):
     batch_dir = _copy_sample(tmp_path)
     manifest = json.loads((batch_dir / "manifest.json").read_text())
