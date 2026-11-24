@@ -44,7 +44,7 @@ def test_different_seed_changes_output():
         json.loads(r)["trip_id"] for r in sb["schedules"]
     ]
     for name in ("historical_trips", "historical_telemetry", "passenger_journeys",
-                 "service_disruptions", "weather_observations"):
+                 "service_disruptions", "weather_observations", "vehicle_depot_assignments"):
         assert sa[name] != sb[name], name
 
 

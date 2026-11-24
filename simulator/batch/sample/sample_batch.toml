@@ -1,12 +1,13 @@
 # Small DE-04 batch config used ONLY to produce the committed sample fixture
-# (simulator/batch/sample/output/) and fast CLI tests: 1 service day,
+# (simulator/batch/sample/output/) and fast CLI tests: 2 service days (so the
+# DE-10 vehicle_depot_assignments sample contains a TRANSFER on day 2),
 # 3-hourly headway, few journeys per trip, 6-hourly weather. Same keys and
 # semantics as simulator/batch/default_batch.toml (see comments there).
 
 [batch]
 seed = 20250106
 start_date = 2025-01-06
-service_days = 1
+service_days = 2
 utc_offset_hours = 10
 
 [schedules]
@@ -102,3 +103,12 @@ heavy_rain_threshold_mm = 6.0
 max_wind_speed_kmh = 70.0
 storm_wind_threshold_kmh = 50.0
 cloudy_probability = 0.35
+
+[fleet_changes]
+# Chosen so the sample is non-vacuous for DE-10: VEH-0001 (which operates
+# trips) moves depot on day 2, so its day-2 trips and its day-2 trip-scoped
+# disruption are attributed to the new depot while day 1 keeps the old one.
+enabled = true
+transfers_per_day = 2
+relief_pool_size = 5
+notice_days = 21

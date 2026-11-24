@@ -25,11 +25,13 @@ def test_default_config_loads_with_expected_shape():
     assert cfg.weather.observations_per_day == 24
     assert len(cfg.batch.service_dates) == 7
     assert {t.effect.value for t in cfg.disruptions.types} == {"DELAY", "BREAKDOWN", "CANCEL"}
+    assert cfg.fleet_changes.enabled
 
 
 def test_sample_config_loads():
     cfg = load_batch_config(SAMPLE_BATCH_CONFIG)
-    assert cfg.batch.service_days == 1
+    # 2 days (was 1 before DE-10) so the committed sample contains a TRANSFER.
+    assert cfg.batch.service_days == 2
     assert cfg.schedules.trips_per_route_per_day == 6  # 06:00..21:00 every 3h
 
 

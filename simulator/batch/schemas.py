@@ -8,7 +8,8 @@ Every dataset row model:
 - carries `updated_at` (UTC) - the **watermark column** a later incremental
   load (PROJECT.md section 11, DE-05+) filters on (`updated_at > last_watermark`);
 - carries `event_date` - the **partition column** (local operating/service
-  date for trip-derived datasets; local observation date for weather);
+  date for trip-derived datasets; local observation date for weather; local
+  effective service date for vehicle-to-depot assignments);
 - forbids unknown fields (`extra="forbid"`), so schema drift fails loudly.
 
 `DATASET_CATALOGUE` is the single machine-readable description of each
@@ -53,6 +54,13 @@ class DisruptionStatus(str, Enum):
     RESOLVED = "RESOLVED"
 
 
+class AssignmentChangeType(str, Enum):
+    """`vehicle_depot_assignments.change_type`."""
+
+    INITIAL = "INITIAL"  # baseline: the DE-01 home depot, effective on start_date
+    TRANSFER = "TRANSFER"  # vehicle moved to a different depot
+
+
 class WeatherCondition(str, Enum):
     CLEAR = "CLEAR"
     CLOUDY = "CLOUDY"
@@ -77,7 +85,10 @@ class ScheduledTrip(_BatchRow):
     direction: Direction
     trip_sequence: int = Field(ge=1, description="1-based order of the trip on its route that day.")
     vehicle_id: str
-    depot_id: str = Field(description="Operating depot = assigned vehicle's home depot.")
+    depot_id: str = Field(
+        description="Operating depot = assigned vehicle's effective depot on event_date "
+        "(see vehicle_depot_assignments)."
+    )
     origin_stop_id: str
     destination_stop_id: str
     stop_count: int = Field(ge=2)
@@ -241,6 +252,37 @@ class WeatherObservation(_BatchRow):
     condition: WeatherCondition
 
 
+class VehicleDepotAssignment(_BatchRow):
+    """`vehicle_depot_assignments` (DE-10): effective-dated vehicle-to-depot
+    assignment change log - the SCD Type 2 source for `dim_vehicle`.
+
+    One INITIAL row per vehicle (its DE-01 home depot) effective on
+    `start_date`, then one TRANSFER row per depot change. A row's depot holds
+    from `effective_from` (local midnight of `event_date`) until the same
+    vehicle's next row takes effect.
+    """
+
+    assignment_id: str = Field(description="VDA-<vehicle_id>-<yyyymmdd effective date>.")
+    vehicle_id: str
+    depot_id: str = Field(description="Depot the vehicle belongs to from effective_from.")
+    previous_depot_id: str | None = Field(description="Null for INITIAL.")
+    change_type: AssignmentChangeType
+    change_sequence: int = Field(ge=1, description="1 = INITIAL; +1 per TRANSFER.")
+    effective_from: AwareDatetime
+
+    @model_validator(mode="after")
+    def _check(self) -> VehicleDepotAssignment:
+        if self.change_type == AssignmentChangeType.INITIAL:
+            if self.previous_depot_id is not None or self.change_sequence != 1:
+                raise ValueError("INITIAL rows have no previous_depot_id and change_sequence 1")
+        else:
+            if self.previous_depot_id is None or self.previous_depot_id == self.depot_id:
+                raise ValueError("TRANSFER rows must move the vehicle to a different depot")
+            if self.change_sequence < 2:
+                raise ValueError("TRANSFER rows have change_sequence >= 2")
+        return self
+
+
 @dataclass(frozen=True)
 class ForeignKey:
     column: str
@@ -355,6 +397,18 @@ DATASET_CATALOGUE: dict[str, DatasetSpec] = {
             primary_key=("observation_id",),
             foreign_keys=(ForeignKey("depot_id", "depots.depot_id"),),
             supports=("fact_route_performance (weather context, optional)", "dim_date", "dim_time"),
+            **_COMMON,
+        ),
+        DatasetSpec(
+            name="vehicle_depot_assignments",
+            model=VehicleDepotAssignment,
+            primary_key=("assignment_id",),
+            foreign_keys=(
+                ForeignKey("vehicle_id", "vehicles.vehicle_id"),
+                ForeignKey("depot_id", "depots.depot_id"),
+                ForeignKey("previous_depot_id", "depots.depot_id", nullable=True),
+            ),
+            supports=("dim_vehicle (SCD Type 2 depot history)", "dim_depot"),
             **_COMMON,
         ),
     )

@@ -32,6 +32,13 @@ def _expected_counts(datasets, reference, cfg):
             if cfg.weather.enabled
             else 0
         ),
+        # DE-10: one INITIAL row per vehicle + transfers_per_day per later date.
+        "vehicle_depot_assignments": len(reference.vehicles)
+        + (
+            cfg.fleet_changes.transfers_per_day * (days - 1)
+            if cfg.fleet_changes.enabled
+            else 0
+        ),
     }
 
 
@@ -57,6 +64,7 @@ def test_default_config_volume_matches_formula():
     assert counts["schedules"] == 1190
     assert counts["service_disruptions"] == 21
     assert counts["weather_observations"] == 672
+    assert counts["vehicle_depot_assignments"] == 56  # 50 vehicles + 1 x 6 later days
     _assert_journey_bounds(datasets, reference, cfg)
     assert all(count > 0 for count in counts.values())
 

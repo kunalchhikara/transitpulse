@@ -1,8 +1,8 @@
 """DE-04: deterministic, config-driven synthetic batch/historical datasets
 (PROJECT.md section 7): schedules, schedule_stop_times, historical_trips,
-historical_telemetry, passenger_journeys, service_disruptions and optional
-weather_observations, all referentially consistent with DE-01's reference
-entities. See the "DE-04 batch datasets" section of `simulator/README.md`.
+historical_telemetry, passenger_journeys, service_disruptions, optional
+weather_observations and (DE-10) vehicle_depot_assignments, all
+referentially consistent with DE-01's reference entities. See the "DE-04 batch datasets" section of `simulator/README.md`.
 """
 
 from simulator.batch.config import BatchConfig, load_batch_config

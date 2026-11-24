@@ -114,7 +114,6 @@ def plan_day_disruptions(
         ).total_seconds()
         // 60
     )
-    vehicles_by_id = {v.vehicle_id: v for v in reference.vehicles}
     targeted_vehicles: set[str] = set()
 
     plans: list[DisruptionPlan] = []
@@ -163,7 +162,8 @@ def plan_day_disruptions(
             duration_minutes=duration,
             delay_impact_seconds=impact,
             route_id=trip.route_id,
-            depot_id=vehicles_by_id[trip.vehicle_id].home_depot_id,
+            # The vehicle's effective depot on the service date (DE-10).
+            depot_id=trip.depot_id,
             trip=trip,
         )
         if type_config.effect == DisruptionEffect.BREAKDOWN:

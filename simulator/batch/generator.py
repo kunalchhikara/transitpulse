@@ -20,6 +20,7 @@ from datetime import timedelta
 from pydantic import BaseModel
 
 from simulator.batch.config import BatchConfig
+from simulator.batch.fleet import generate_fleet_history
 from simulator.batch.operations import execute_day, plan_day_disruptions
 from simulator.batch.schemas import (
     DATASET_CATALOGUE,
@@ -29,6 +30,7 @@ from simulator.batch.schemas import (
     ScheduledStopTime,
     ScheduledTrip,
     ServiceDisruption,
+    VehicleDepotAssignment,
     WeatherObservation,
 )
 from simulator.batch.timetable import (
@@ -53,6 +55,7 @@ class BatchDatasets:
     passenger_journeys: list[PassengerJourney] = field(default_factory=list)
     service_disruptions: list[ServiceDisruption] = field(default_factory=list)
     weather_observations: list[WeatherObservation] = field(default_factory=list)
+    vehicle_depot_assignments: list[VehicleDepotAssignment] = field(default_factory=list)
     #: Trips that had to reuse a not-yet-free vehicle (pool too small). 0 at default scale.
     vehicle_overlap_count: int = 0
 
@@ -94,10 +97,20 @@ def generate_batch_datasets(
     offset = batch_config.batch.utc_offset_hours
     publish_lead = timedelta(days=batch_config.schedules.publish_lead_days)
 
-    out = BatchDatasets()
+    # DE-10: assignment history first, so each day's trips (and trip-scoped
+    # disruptions) are attributed to the vehicle's effective depot. Uses its
+    # own RNG streams, so it never perturbs any other dataset's draws.
+    fleet = generate_fleet_history(reference, batch_config)
+
+    out = BatchDatasets(vehicle_depot_assignments=list(fleet.assignments))
     for service_date in batch_config.batch.service_dates:
         trips, overlaps = build_day_timetable(
-            service_date, reference, batch_config, runtimes_by_route, pools
+            service_date,
+            reference,
+            batch_config,
+            runtimes_by_route,
+            pools,
+            fleet.depot_on(service_date),
         )
         out.vehicle_overlap_count += overlaps
         published_at = local_midnight_utc(service_date, offset) - publish_lead

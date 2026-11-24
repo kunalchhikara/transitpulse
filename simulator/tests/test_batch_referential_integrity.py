@@ -17,6 +17,7 @@ from simulator.tests._batch_helpers import (
     SAMPLE_SCALE_CONFIG,
     default_datasets,
     default_reference,
+    effective_depot_lookup,
     generate,
     read_jsonl,
     rows_as_dicts,
@@ -110,7 +111,7 @@ def test_historical_trips_are_one_to_one_with_scheduled_trips(tables):
 def test_schedule_stop_times_follow_the_route_stop_sequence(tables):
     batch_tables, reference = tables
     routes = {r["route_id"]: r for r in reference["routes"]}
-    vehicles = {v["vehicle_id"]: v for v in reference["vehicles"]}
+    depot_of = effective_depot_lookup(batch_tables["vehicle_depot_assignments"])
     by_trip: dict[str, list[dict]] = {}
     for st in batch_tables["schedule_stop_times"]:
         by_trip.setdefault(st["trip_id"], []).append(st)
@@ -126,8 +127,9 @@ def test_schedule_stop_times_follow_the_route_stop_sequence(tables):
         assert s["stop_count"] == len(expected)
         assert stop_times[0]["scheduled_departure"] == s["scheduled_departure"]
         assert stop_times[-1]["scheduled_arrival"] == s["scheduled_arrival"]
-        # Operating depot is the assigned vehicle's home depot.
-        assert s["depot_id"] == vehicles[s["vehicle_id"]]["home_depot_id"]
+        # Operating depot is the assigned vehicle's effective depot on the
+        # service date (DE-10; = DE-01 home depot until the vehicle transfers).
+        assert s["depot_id"] == depot_of(s["vehicle_id"], s["event_date"])
 
 
 def test_telemetry_snapshots_reference_real_trip_stops(tables):
@@ -168,7 +170,7 @@ def test_passenger_journeys_reference_real_operated_trips_and_stops(tables):
 def test_disruptions_are_consistent_with_trips_they_reference(tables):
     batch_tables, reference = tables
     routes = {r["route_id"]: r for r in reference["routes"]}
-    vehicles = {v["vehicle_id"]: v for v in reference["vehicles"]}
+    depot_of = effective_depot_lookup(batch_tables["vehicle_depot_assignments"])
     schedules = {s["trip_id"]: s for s in batch_tables["schedules"]}
     stop_times = {(st["trip_id"], st["stop_id"]) for st in batch_tables["schedule_stop_times"]}
     for d in batch_tables["service_disruptions"]:
@@ -176,7 +178,7 @@ def test_disruptions_are_consistent_with_trips_they_reference(tables):
             s = schedules[d["trip_id"]]
             assert d["vehicle_id"] == s["vehicle_id"]
             assert d["route_id"] == s["route_id"]
-            assert d["depot_id"] == vehicles[d["vehicle_id"]]["home_depot_id"]
+            assert d["depot_id"] == depot_of(d["vehicle_id"], d["event_date"])
             assert (d["trip_id"], d["stop_id"]) in stop_times
         else:
             assert d["vehicle_id"] is None and d["trip_id"] is None and d["stop_id"] is None
