@@ -34,10 +34,29 @@ Per-event pipeline (`produce_event`):
           corruption (probabilistic) -- *after* step (d) the payload may no
           longer be a structurally valid `TelemetryEvent` at all, which is
           the point (see `simulator/incidents/malformed.py`).
-    2. Delivery-level transforms, which decide *which* payload is actually
-       returned for this call (`_apply_out_of_order` then `_apply_duplicate`):
-       e. out-of-order reorder-buffer push/pop (only if enabled)
-       f. duplicate replay from recent history (only if enabled)
+    2. Delivery-level transforms (`_apply_out_of_order` then
+       `_apply_duplicate`):
+       e. out-of-order reorder-buffer push/pop (only if enabled) -- decides
+          *which* original payload `produce_event` returns for this call
+       f. duplicate replay from recent history (only if enabled) -- never
+          changes what `produce_event` returns; a fire *queues* one extra,
+          verbatim copy of an earlier delivered payload (see below)
+
+Duplicate delivery (FU-05): a duplicate is an *additional* delivery, never
+a replacement -- every original event is delivered exactly once, and each
+duplicate fire adds exactly one more. Because `run()` calls `sink` exactly
+once per `produce_event` call, the extra copy cannot travel through
+`produce_event`'s return value without either dropping an original (the
+pre-FU-05 bug) or consuming a generator tick. Instead it is queued, and
+`delivery_sink(sink)` wraps the caller's sink so each queued replay is
+forwarded immediately after the original that triggered it, inside the
+same `run()` iteration (no extra pacing slot, no generator tick). So
+`run(max_events=N)` still means N `produce_event` calls == N generator
+ticks (plus `hold_ticks` pre-filled ticks when out-of-order is enabled),
+and the total number of delivered payloads is that originals count plus
+the number of duplicate fires. A caller that loops `produce_event` without
+`delivery_sink` loses nothing: undelivered replays are returned, first, by
+`flush_pending()`.
 
 `rate_multiplier(tick)` is the separate, runner-level hook for the volume
 spike scenario (PROJECT.md section 13 item 6) -- it does not go through
@@ -47,6 +66,8 @@ point" docstring note.
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Callable
 from datetime import timedelta
 from random import Random
 from typing import Any
@@ -72,6 +93,11 @@ class IncidentInjector:
         self._next_tick = 0
         self._next_rate_tick = 0
         self._history: list[EventPayload] = []
+        #: Replays queued by duplicate fires, awaiting delivery via
+        #: `delivery_sink` (or `flush_pending`). See module docstring.
+        self._pending_duplicates: list[EventPayload] = []
+        #: Total duplicate fires so far (== extra deliveries produced).
+        self.duplicates_injected = 0
         self._malformed_mode_index = 0
         # Edge-triggered state per window-based scenario, so "fired"/
         # "recovered" are each logged exactly once per transition rather
@@ -105,16 +131,34 @@ class IncidentInjector:
     # -- public API ---------------------------------------------------
 
     def produce_event(self, tick: int) -> EventPayload:
-        """Produce one output payload for external call index `tick`
-        (ignored for underlying-generator indexing -- see module docstring;
-        used only for window/log bookkeeping where it is safe to do so,
-        i.e. whenever out-of-order pre-fill offset is zero)."""
+        """Produce the next *original* payload for external call index
+        `tick` (ignored for underlying-generator indexing -- see module
+        docstring; used only for window/log bookkeeping where it is safe to
+        do so, i.e. whenever out-of-order pre-fill offset is zero).
+
+        Never returns a duplicate replay: a duplicate fire on this call is
+        queued for `delivery_sink`/`flush_pending` instead (FU-05)."""
         payload = self._build_payload(self._next_tick)
         self._next_tick += 1
 
         payload = self._apply_out_of_order(payload, tick)
-        payload = self._apply_duplicate(payload, tick)
+        self._apply_duplicate(payload, tick)
         return payload
+
+    def delivery_sink(self, sink: Callable[[EventPayload], None]) -> Callable[[EventPayload], None]:
+        """Wrap `sink` so that, after forwarding each original payload, it
+        also forwards any duplicate replays queued by the `produce_event`
+        call that produced it. Pass the result to `runner.run()` in place of
+        `sink` (as `simulator/incidents/cli.py` does): each duplicate then
+        arrives immediately after its triggering original, within the same
+        run iteration, so a graceful stop never separates the two."""
+
+        def deliver(payload: EventPayload) -> None:
+            sink(payload)
+            for replay in self._take_pending_duplicates():
+                sink(replay)
+
+        return deliver
 
     def rate_multiplier(self, tick: int) -> float:
         """PROJECT.md section 13 item 6 (volume spike): the runner-level
@@ -133,11 +177,13 @@ class IncidentInjector:
         return cfg.rate_multiplier if active else 1.0
 
     def flush_pending(self) -> list[EventPayload]:
-        """Drain and return any payloads still sitting in the out-of-order
-        reorder buffer at the end of a bounded run (nothing is lost, only
-        delayed -- call this after the main loop to emit the final
-        `hold_ticks` events)."""
-        drained = list(self._reorder_buffer)
+        """Drain and return everything not yet delivered at the end of a
+        bounded run (nothing is lost, only delayed -- call this after the
+        main loop): first any duplicate replays still queued (none when the
+        main loop used `delivery_sink`), then the final `hold_ticks`
+        payloads still in the out-of-order reorder buffer. Makes no RNG
+        draws, so it never fires a new incident."""
+        drained = self._take_pending_duplicates() + list(self._reorder_buffer)
         self._reorder_buffer.clear()
         return drained
 
@@ -223,25 +269,38 @@ class IncidentInjector:
             )
         return released
 
-    def _apply_duplicate(self, payload: EventPayload, tick: int) -> EventPayload:
+    def _apply_duplicate(self, payload: EventPayload, tick: int) -> None:
+        """On a fire, queue one verbatim copy of a payload delivered on an
+        *earlier* call (chosen from the last `replay_window` originals) as
+        an extra delivery -- `payload` itself is always still delivered
+        (FU-05). Replays are not added to the history, so only originals
+        are ever replayed. RNG draw order is unchanged from DE-03."""
         cfg = self.incidents_config.duplicate
-        if not cfg.enabled:
-            self._remember(payload)
-            return payload
-        triggered = self._rng.random() < cfg.probability_per_tick
-        if triggered and self._history:
-            replay = dict(self._history[self._rng.randrange(len(self._history))])
-            self._logger.info(
-                "duplicate incident fired",
-                extra={"scenario": "duplicate", "tick": tick, "replayed_event_id": replay.get("event_id")},
-            )
-            self._remember(payload)
-            return replay
+        if cfg.enabled:
+            triggered = self._rng.random() < cfg.probability_per_tick
+            if triggered and self._history:
+                replay = copy.deepcopy(self._history[self._rng.randrange(len(self._history))])
+                self._logger.info(
+                    "duplicate incident fired",
+                    extra={
+                        "scenario": "duplicate",
+                        "tick": tick,
+                        "replayed_event_id": replay.get("event_id"),
+                        "delivered_after_event_id": payload.get("event_id"),
+                    },
+                )
+                self._pending_duplicates.append(replay)
+                self.duplicates_injected += 1
         self._remember(payload)
-        return payload
+
+    def _take_pending_duplicates(self) -> list[EventPayload]:
+        drained, self._pending_duplicates = self._pending_duplicates, []
+        return drained
 
     def _remember(self, payload: EventPayload) -> None:
-        self._history.append(dict(payload))
+        # Deep copy: a consumer mutating a delivered payload must never
+        # alter what a later replay of it contains.
+        self._history.append(copy.deepcopy(payload))
         window = self.incidents_config.duplicate.replay_window
         if len(self._history) > window:
             self._history.pop(0)

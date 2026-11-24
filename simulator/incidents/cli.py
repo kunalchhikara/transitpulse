@@ -17,6 +17,15 @@ recovered and when) go to stderr (or `--log-file`), via the
 `simulator.incidents` logger -- kept separate from the event stream, same
 pattern as `simulator/generator/cli.py`.
 
+--max-events N bounds the paced main loop to N generator ticks (N
+*original* events, each delivered exactly once). Delivered lines can exceed
+N: when out-of-order is enabled its `hold_ticks` pre-filled originals are
+flushed after the loop, and every duplicate fire adds one extra line -- a
+verbatim replay of an earlier line, written right after the original that
+triggered it (FU-05: a duplicate is an addition, never a replacement). So
+total lines = N (+ hold_ticks if out-of-order) + duplicate fires, and the
+set of event_ids is identical with duplicates on or off.
+
 --enable-* flags are additive overrides on top of whatever `--incidents-
 config` loads (default: every scenario `enabled = false`) -- each flips
 exactly one scenario's `enabled` to true without needing a bespoke TOML
@@ -133,7 +142,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.output is not None
         else sys.stdout
     )
-    sink = _make_sink(output_stream)
+    write = _make_sink(output_stream)
+    delivered = 0
+
+    def sink(payload: EventPayload) -> None:
+        nonlocal delivered
+        write(payload)
+        delivered += 1
+
     try:
         logger.info(
             "incident-aware generation started",
@@ -147,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         summary = run(
             injector,
-            sink,
+            injector.delivery_sink(sink),
             clock=SystemClock(),
             max_events=args.max_events,
             should_stop=stop_requested.is_set,
@@ -158,7 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(
             "incident-aware generation run complete",
             extra={
+                # Generator ticks in the paced main loop (== --max-events
+                # unless stopped early); see the module docstring.
                 "events_emitted": summary.events_emitted,
+                "payloads_delivered": delivered,
+                "duplicates_injected": injector.duplicates_injected,
                 "elapsed_seconds": round(summary.elapsed_seconds, 3),
                 "stopped_early": summary.stopped_early,
             },
