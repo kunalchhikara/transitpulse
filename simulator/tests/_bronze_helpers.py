@@ -6,7 +6,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -118,11 +119,51 @@ def assert_round_trip(
         assert out_line.startswith(line.strip()[:-1]), f"line {number} bytes changed"
 
 
-def run_cli(*args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+def run_cli(*args: str, stdin: bytes | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "simulator.bronze", *args],
         cwd=REPO_ROOT,
         input=stdin,
         capture_output=True,
         check=False,
+        env=env,
     )
+
+
+def ticking_clock(start: datetime, step: timedelta = timedelta(seconds=1)):
+    """A deterministic clock that advances by `step` on every call, so each
+    attempt's `started_at` / `ended_at` are distinct and predictable."""
+    state = {"now": start - step}
+
+    def clock() -> datetime:
+        state["now"] += step
+        return state["now"]
+
+    return clock
+
+
+def iter_strings(value: Any, where: str = "$") -> Iterator[tuple[str, str]]:
+    """Every string in a JSON value - dict keys included - with its JSON path."""
+    if isinstance(value, str):
+        yield where, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield f"{where}.<key>", key
+            yield from iter_strings(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from iter_strings(item, f"{where}[{index}]")
+
+
+def path_leaks(manifest: dict[str, Any], *forbidden: str | Path) -> list[str]:
+    """DE-09 / FU-04 check: every string in `manifest` that starts with `/` or
+    contains one of the `forbidden` substrings (e.g. the home directory, the
+    absolute input/output roots). Returns the offending `path: value` pairs
+    (empty list == clean). A forbidden value of `/` alone is ignored (it is
+    covered by the leading-slash rule and would match every relative path)."""
+    needles = sorted({str(f) for f in forbidden if str(f) not in ("", "/")}, key=len, reverse=True)
+    leaks = []
+    for where, text in iter_strings(manifest):
+        if text.startswith("/") or any(needle in text for needle in needles):
+            leaks.append(f"{where}: {text!r}")
+    return leaks
