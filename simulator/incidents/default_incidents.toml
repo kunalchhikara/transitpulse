@@ -1,0 +1,61 @@
+# Default DE-03 incident configuration. Every scenario defaults to
+# `enabled = false` -- this file, loaded as-is, reproduces DE-02's baseline
+# incident-free behaviour. Flip individual `enabled` flags (via a copy of
+# this file passed to --incidents-config, or a CLI --enable-* flag -- see
+# simulator/incidents/cli.py) to turn scenarios on independently, and tune
+# intensity below rather than editing code, per PROJECT.md section 19.
+
+[incidents]
+seed = 20250202
+
+[incidents.malformed]
+enabled = false
+probability_per_tick = 0.05
+modes = [
+    "null_vehicle_id",
+    "invalid_coordinates",
+    "negative_speed",
+    "malformed_timestamp",
+    "unknown_route",
+    "missing_field",
+]
+
+[incidents.duplicate]
+enabled = false
+probability_per_tick = 0.05
+replay_window = 20
+
+[incidents.late_event]
+enabled = false
+probability_per_tick = 0.05
+min_skew_seconds = 120
+max_skew_seconds = 600
+late_threshold_seconds = 60
+
+[incidents.out_of_order]
+enabled = false
+probability_per_tick = 0.3
+hold_ticks = 3
+
+[incidents.congestion]
+enabled = false
+route_id = "ROUTE-01"
+speed_multiplier = 0.3
+extra_delay_seconds = 240
+[incidents.congestion.window]
+start_tick = 0
+duration_ticks = 200
+
+[incidents.volume_spike]
+enabled = false
+rate_multiplier = 6.0
+[incidents.volume_spike.window]
+start_tick = 0
+duration_ticks = 100
+
+[incidents.breakdown]
+enabled = false
+vehicle_ids = ["VEH-0001"]
+[incidents.breakdown.window]
+start_tick = 0
+duration_ticks = 150

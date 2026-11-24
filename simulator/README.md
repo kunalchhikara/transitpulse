@@ -7,10 +7,11 @@ Purpose: deterministic synthetic event generator, synthetic reference/domain dat
 Bronze/Silver/Gold transformation logic that can be tested without Fabric, per
 `PROJECT.md` sections 5-13, 19.
 
-Status: DE-01 (Synthetic Transport Domain Model & Schemas) and DE-02
-(Deterministic Simulator Core Engine) implemented. Remaining scope (incidents,
-batch/historical datasets, Bronze/Silver/Gold) is not yet implemented — see
-`docs/BACKLOG.md` (DE-03..DE-07).
+Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
+(Deterministic Simulator Core Engine) and DE-03 (Incident Injection
+Scenarios in Simulator) implemented. Remaining scope (batch/historical
+datasets, Bronze/Silver/Gold) is not yet implemented — see
+`docs/BACKLOG.md` (DE-04..DE-07).
 
 ## Dependency choice: Pydantic
 
@@ -57,9 +58,12 @@ dependencies without a concrete reason" rule:
   (`python -m simulator.reference --output-dir <dir>`) to write it to JSON.
 - `simulator/generator/` - DE-02's runtime telemetry generator: see
   "DE-02: Deterministic Simulator Core Engine" below.
+- `simulator/incidents/` - DE-03's incident injection scenarios: see
+  "DE-03: Incident Injection Scenarios in Simulator" below.
 - `simulator/tests/` - pytest suite (determinism, count-matches-config,
   coordinate-bounding-box, referential integrity, schema-validation positive
-  and negative cases, plus DE-02's generator/movement/rate/shutdown tests).
+  and negative cases, DE-02's generator/movement/rate/shutdown tests, plus
+  DE-03's per-scenario/recovery/combined/determinism incident tests).
   Run with `pytest simulator -q` from the repo root.
 
 ## TelemetryEvent field contract (PROJECT.md section 6)
@@ -252,6 +256,97 @@ already-fully-written-and-flushed events, never mid-write. Exit code is 0.
 Verified by sending a real SIGINT to a running subprocess and asserting
 every output line is complete, parseable JSON with no truncated last line
 (`simulator/tests/test_graceful_shutdown.py`).
+
+## DE-03: Incident Injection Scenarios in Simulator
+
+`simulator/incidents/` extends DE-02 with the 8 configurable,
+individually-triggerable incident scenarios from `PROJECT.md` section 13.
+It is purely additive on top of `simulator/generator/`: `IncidentInjector`
+(`simulator/incidents/injector.py`) *wraps* a `TelemetryGenerator` rather
+than forking it — every event starts as exactly what
+`TelemetryGenerator.produce_event(tick)` would have produced, called with
+strictly increasing `tick` values exactly once each, preserving DE-02's own
+determinism contract. The one hook point added to `simulator/generator/`
+itself is a single additive parameter on `simulator.generator.runner.run`:
+`rate_multiplier` (a tick -> float callback, default `None` = unmodified
+behaviour, used only by the volume-spike scenario to scale the pacing
+interval) — see that module's "DE-03 hook point" docstring note. Everything
+else (malformed-data corruption, duplicate replay, late/out-of-order
+delivery, congestion, breakdown) lives entirely in `simulator/incidents/`
+and never touches `simulator/generator/core.py`, `movement.py`,
+`config.py`, or `cli.py`.
+
+Downstream processing consequences (e.g. a real service-incident record for
+a breakdown, or Silver-layer quarantine of malformed events) are explicitly
+out of this story's scope — DE-03 only proves the generator can produce the
+correct fault conditions; see `docs/BACKLOG.md` DE-06/DE-07.
+
+### Scenario reference table (PROJECT.md section 13)
+
+| # | PROJECT.md §13 scenario | Enable (config) | Enable (CLI flag) | Effect |
+|---|---|---|---|---|
+| 1 | Bad/malformed data | `[incidents.malformed]` `enabled = true` | `--enable-malformed` | Deterministically round-robins through configured `modes`: null `vehicle_id`, invalid lat/long (999/-999), negative `speed_kmh` (-42), non-parsable `event_time` string, unknown `route_id`, or a missing field (`occupancy` dropped) — applied to the raw JSON payload, since a structurally-valid `TelemetryEvent` cannot hold these values. |
+| 2 | Duplicate-event injection | `[incidents.duplicate]` `enabled = true` | `--enable-duplicate` | With probability `probability_per_tick`, replaces the current tick's payload with a verbatim (byte-identical) copy of a payload already delivered within the last `replay_window` deliveries, same `event_id` included. |
+| 3 | Late-event injection | `[incidents.late_event]` `enabled = true` | `--enable-late-event` | With probability `probability_per_tick`, subtracts a uniformly-sampled `[min_skew_seconds, max_skew_seconds]` skew from `event_time` only (`generated_at` unchanged), guaranteed `>= late_threshold_seconds` by config validation. |
+| 4 | Out-of-order delivery | `[incidents.out_of_order]` `enabled = true` | `--enable-out-of-order` | A `hold_ticks`-deep reorder buffer, pre-filled before the run starts; each delivery pushes the newest payload in and (with probability `probability_per_tick`) pops a *random* buffered payload instead of the oldest — genuine reordering, with no event lost or duplicated (call `IncidentInjector.flush_pending()` to drain the final `hold_ticks` events at the end of a bounded run). |
+| 5 | Route congestion | `[incidents.congestion]` `enabled = true` | `--enable-congestion` | For every event on `route_id`, inside `window` (`[start_tick, start_tick + duration_ticks)`), multiplies `speed_kmh` by `speed_multiplier` (default 0.3) and adds `extra_delay_seconds` (default 240) to `delay_seconds`, recomputing `status` against the generator's own `delayed_status_threshold_seconds`. |
+| 6 | Volume spike | `[incidents.volume_spike]` `enabled = true` | `--enable-volume-spike` | Inside `window`, `IncidentInjector.rate_multiplier(tick)` returns `rate_multiplier` (default 6.0) instead of `1.0`, passed to `runner.run(..., rate_multiplier=injector.rate_multiplier)` to scale the pacing interval — the emitted events themselves are untouched, only how fast they are paced. |
+| 7 | Vehicle breakdown | `[incidents.breakdown]` `enabled = true` | `--enable-breakdown` | For every event whose `vehicle_id` is in `vehicle_ids`, inside `window`, forces `status = "BREAKDOWN"` and `speed_kmh = 0.0`. Creating a downstream service-incident record is explicitly out of this story's scope. |
+| 8 | Recovery | (cross-cutting) | n/a | Scenarios 5-7 are all `window`-bounded (`RecoveryWindow`); once `tick >= start_tick + duration_ticks`, behaviour is byte-identical to a plain no-incident baseline run sharing the same seed/config — demonstrated explicitly in `simulator/tests/test_incidents_recovery.py` and in each of scenarios 5-7's own recovery test. |
+
+### Configuration: `simulator/incidents/config.py` / `default_incidents.toml`
+
+`IncidentsConfig` is a *separate* config surface from `GeneratorConfig`
+(DE-02) and `ScaleConfig`/`ValidationThresholds` (DE-01) — every sub-config
+below defaults to `enabled = false`, so the bundled
+`simulator/incidents/default_incidents.toml` reproduces DE-02's baseline,
+incident-free behaviour exactly. All intensity knobs (probabilities, skew
+ranges, speed/delay multipliers, rate multiplier, windows, replay/hold
+depths) are externalized to that TOML per `PROJECT.md` section 19, not
+hardcoded. `IncidentsConfig.seed` seeds a `random.Random` instance *owned
+by the incidents layer*, kept entirely separate from `GeneratorConfig.seed`
+— enabling/disabling any subset of scenarios never changes the underlying
+generator's own event content, only what `IncidentInjector` additionally
+does to/with it (verified in `simulator/tests/test_incidents_determinism.py`).
+
+### CLI usage
+
+```
+python -m simulator.incidents
+python -m simulator.incidents --enable-malformed --enable-duplicate
+python -m simulator.incidents --max-events 500 --output events.ndjson
+python -m simulator.incidents --incidents-config my_incidents.toml
+```
+
+`--enable-<scenario>` (one flag per row of the table above, e.g.
+`--enable-congestion`) force-enables that scenario on top of whatever
+`--incidents-config` loads, without needing a bespoke TOML file for a quick
+demo. Every other flag (`--scale-config`, `--generator-config`, `--seed`,
+`--max-events`, `--output`, `--log-file`, `--log-level`) mirrors
+`simulator/generator/cli.py`. Output lines are plain JSON dicts (not always
+a valid `TelemetryEvent` — see scenario 1), written to stdout/`--output`;
+structured JSON-lines incident logs (which scenario fired/recovered, when,
+with what parameters) go to stderr/`--log-file` via the
+`simulator.incidents` logger, reusing DE-02's `JsonLinesFormatter`
+(`simulator/incidents/logging_setup.py`) — never interleaved with the event
+stream.
+
+### Testing
+
+One deterministic test module per scenario
+(`simulator/tests/test_incidents_malformed.py`, `..._duplicate.py`,
+`..._late_event.py`, `..._out_of_order.py`, `..._congestion.py`,
+`..._volume_spike.py`, `..._breakdown.py`), plus a standalone recovery test
+(`test_incidents_recovery.py`), a combined-scenario test
+(`test_incidents_combined.py`, including all seven scenarios enabled at
+once), a determinism test (`test_incidents_determinism.py`), a config
+validation test (`test_incidents_config.py`), a CLI smoke test
+(`test_incidents_cli.py`), and a direct unit test for the one
+`runner.rate_multiplier` hook added to `simulator/generator/`
+(`test_runner_rate_multiplier_hook.py`). Every probabilistic scenario is
+exercised deterministically (`probability_per_tick = 1.0` or a fixed seed),
+and every time-based assertion uses `FakeClock` — no real `time.sleep`
+anywhere in this suite, per `PROJECT.md` section 21.
 
 ## IMPLEMENTED - NOT CONNECTED
 
