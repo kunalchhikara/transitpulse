@@ -161,3 +161,62 @@ source" pattern is explicit and reusable for later pages:
   `fixtureNote` in the fixture says so in-page as well.
 - Nav links on Home are rendered from `NAV_ITEMS` (`src/lib/navigation.ts`),
   never hand-duplicated, so the page can't drift from the real routes.
+
+### Live Operations fixture (WE-03)
+
+Status: WE-03 (Live Operations Page — Demo Mode Fleet View) implemented.
+Live Operations now shows a real DEMO-mode fleet snapshot; it replaces the
+WE-01 `StubPage` placeholder for this route only.
+
+Live Operations follows the exact fixture + type-contract + runtime-guard
+convention WE-02 established for Home (`src/fixtures/<page>.json` +
+`src/lib/<page>Fixture.ts`):
+
+- **Fixture file**: `src/fixtures/vehicles.json` — a small, hand-authored
+  static JSON snapshot of 8 vehicles across several routes and all 4
+  vehicle statuses, imported directly like `home.json`.
+- **Type contract**: `src/lib/vehiclesFixture.ts` defines `VehiclesFixture`/
+  `VehicleSnapshot`/`VehicleStatus` and the same two checks as
+  `homeFixture.ts` (`isVehiclesFixture` the guard, `assertVehiclesFixture`
+  the build-time-failing assertion used by `src/app/live-operations/page.tsx`).
+  `src/lib/vehiclesFixture.test.ts` exercises both the real fixture and a
+  set of deliberately malformed shapes (bad status enum, negative
+  occupancy/speed, missing fields) against this contract.
+
+**Fixture-to-schema alignment.** `VehicleSnapshot`'s fields are loosely
+based on two Pydantic models in `simulator/schemas/` — a documented
+*contract*, not a code or network dependency (this fixture does not import
+simulator code, and nothing in this page fetches, runs, or connects to the
+simulator or Fabric):
+
+| Fixture field  | Simulator source                                              |
+| -------------- | -------------------------------------------------------------- |
+| `vehicleId`    | `entities.Vehicle.vehicle_id` / `telemetry.TelemetryEvent.vehicle_id` |
+| `fleetNumber`  | `entities.Vehicle.fleet_number`                                |
+| `routeId`      | `entities.Route.route_id` / `telemetry.TelemetryEvent.route_id` |
+| `routeNumber`  | `entities.Route.route_number`                                  |
+| `status`       | `telemetry.VehicleStatus` enum (`IN_SERVICE` / `DELAYED` / `BREAKDOWN` / `OUT_OF_SERVICE`) |
+| `occupancy`    | `telemetry.TelemetryEvent.occupancy`                            |
+| `capacity`     | `entities.Vehicle.capacity`                                     |
+| `delaySeconds` | `telemetry.TelemetryEvent.delay_seconds`                        |
+| `speedKmh`     | `telemetry.TelemetryEvent.speed_kmh`                             |
+
+**List, not map — deliberately.** `docs/BACKLOG.md` (WE-03) explicitly
+defers any mapping/charting library decision to a later, separately-approved
+story, and the Lead's backlog review notes flag it as an unapproved
+cost/architecture watch-item. A plain, accessible HTML `<table>` satisfies
+the acceptance criteria (route/status/occupancy/delay per vehicle) without
+adding a dependency, a bundle-size cost, or a geocoding/tile-provider
+question that would need its own approval. The table uses semantic
+`<caption>`/`<th scope="col">` markup and colour-coded status badges with
+text labels (not colour alone), consistent with the `jest-axe` smoke check
+in `src/__tests__/accessibility.test.tsx`, which renders this page's real
+content (not just the WE-01 stub) now that WE-03 is implemented.
+
+**No network calls.** `vehicles.json` is a static import, resolved at
+build time like `home.json`; there is no `fetch`/`axios`/XHR anywhere in
+`src/app/live-operations/page.tsx`, `src/fixtures/vehicles.json`, or
+`src/lib/vehiclesFixture.ts`. `src/app/live-operations/page.test.tsx`
+asserts this directly by installing a `fetch` spy before rendering and
+checking it is never called. `ModeIndicator` stays `DEMO`, and the
+fixture's own `fixtureNote` repeats the disclosure in-page.
