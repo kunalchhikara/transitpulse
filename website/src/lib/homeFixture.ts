@@ -6,13 +6,15 @@
  * `website/README.md` "Home page fixture (WE-02)". This module is the
  * single source of truth for what a well-formed home fixture looks like:
  *
- *  - `HomeFixture`/`HomeStat` give the JSON import a compile-time
- *    structural check (see `src/app/page.tsx`, which assigns the imported
- *    JSON literal to this interface).
- *  - `isHomeFixture`/`assertHomeFixture` give a runtime check, so a
- *    corrupted or hand-edited-wrong fixture fails loudly and specifically
- *    instead of rendering `undefined` deep inside JSX or silently showing
- *    wrong numbers.
+ *  - `HomeFixture`/`HomeStat` give the JSON import a structural type (see
+ *    `src/app/page.tsx`, which types the imported JSON literal as this
+ *    interface) — but since the import is typed `unknown` at the guard
+ *    boundary, this alone is not checked by `tsc`.
+ *  - `isHomeFixture`/`assertHomeFixture` give the real enforcement: a
+ *    build-time/runtime check. `assertHomeFixture` runs at module load
+ *    during Next.js static generation, so a corrupted or hand-edited-wrong
+ *    fixture fails the build loudly and specifically instead of rendering
+ *    `undefined` deep inside JSX or silently showing wrong numbers.
  *
  * `value` on a stat is a plain number (not a pre-formatted string) so the
  * page can render it consistently and a future connected data source could

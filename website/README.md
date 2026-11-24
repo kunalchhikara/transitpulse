@@ -143,11 +143,13 @@ source" pattern is explicit and reusable for later pages:
   convention for all future page fixtures too: `src/fixtures/<page>.json`.
 - **Type contract**: `src/lib/homeFixture.ts` defines `HomeFixture`/
   `HomeStat` and two checks:
-  - a **compile-time** check — `src/app/page.tsx` assigns the imported JSON
-    through `assertHomeFixture`, so a shape mismatch is a type/build error;
-  - a **runtime** check — `assertHomeFixture` throws (and `isHomeFixture`
-    is the underlying type guard) if the fixture is malformed, so a bad
-    hand-edit to the JSON fails loudly instead of rendering broken content.
+  - a **build-time/runtime** check — `assertHomeFixture` runs at module
+    load during Next.js static generation (not caught by `tsc`, since its
+    parameter is typed `unknown`), so a shape mismatch fails the build
+    loudly and specifically instead of rendering broken content;
+  - the underlying **type guard** is `isHomeFixture`, which `assertHomeFixture`
+    calls before throwing, so a bad hand-edit to the JSON is reported with a
+    specific reason rather than silently rendering wrong/undefined content.
   `src/lib/homeFixture.test.ts` exercises both the real fixture and a set
   of deliberately malformed shapes against this contract.
 - **Numbers shown are illustrative, not live.** The stat block values (50
