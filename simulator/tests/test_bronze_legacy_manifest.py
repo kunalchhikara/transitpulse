@@ -21,7 +21,6 @@ touched by DE-09.
 from __future__ import annotations
 
 import copy
-import json
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path

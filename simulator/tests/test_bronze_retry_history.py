@@ -23,6 +23,7 @@ from simulator.bronze import (
     MalformedInputError,
     ParseErrorPolicy,
     SourceManifestError,
+    fixed_clock,
     ingest_batch,
     ingest_stream,
     load_bronze_config,
@@ -50,6 +51,12 @@ ATTEMPT_KEYS = (*SILVER_GOLD_ATTEMPT_KEYS, "status", "duration_seconds", "totals
 def expected_entry(failed_manifest: dict) -> dict:
     assert failed_manifest["status"] == "FAILED"
     return {key: failed_manifest[key] for key in ATTEMPT_KEYS}
+
+
+def same_time_as(result):
+    """A fixed clock at `result`'s ingestion time, for a never-failed
+    reference run whose data files must be byte-identical."""
+    return fixed_clock(datetime.fromisoformat(result.manifest["ingestion_time"]))
 
 
 def _data_files(root):
@@ -121,7 +128,7 @@ def test_two_failures_then_success_keeps_exactly_two_attempts(tmp_path, monkeypa
     assert json.loads(store.manifest_path("r1").read_text()) == result.manifest
 
     # Accounting identities and data equal a never-failed run.
-    clean = ingest_stream([src], run_id="r1", output_dir=tmp_path / "clean", clock=FIXED_CLOCK, config=STRICT)
+    clean = ingest_stream([src], run_id="r1", output_dir=tmp_path / "clean", clock=same_time_as(result), config=STRICT)
     assert result.manifest["totals"] == clean.manifest["totals"]
     assert result.manifest["totals"]["records_written"] == len(lines)
     assert accounting_identity_holds(result.manifest["totals"])
@@ -171,7 +178,7 @@ def test_batch_retry_history_two_source_manifest_failures(tmp_path):
     assert result.manifest["previous_attempts"] == [expected_entry(f) for f in failed]
     assert [h["error"]["type"] for h in result.manifest["previous_attempts"]] == ["SourceManifestError"] * 2
     assert accounting_identity_holds(result.manifest["totals"])
-    clean = ingest_batch(SAMPLE_BATCH_DIR, run_id="b1", output_dir=tmp_path / "clean", clock=FIXED_CLOCK)
+    clean = ingest_batch(SAMPLE_BATCH_DIR, run_id="b1", output_dir=tmp_path / "clean", clock=same_time_as(result))
     assert result.manifest["totals"] == clean.manifest["totals"]
     assert _data_files(out) == _data_files(tmp_path / "clean")
 
