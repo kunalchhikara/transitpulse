@@ -69,7 +69,7 @@ def generate_fleet_history(reference: ReferenceDataset, config: BatchConfig) -> 
     fleet_cfg = config.fleet_changes
     seed = config.batch.seed
     offset = config.batch.utc_offset_hours
-    notice = timedelta(days=fleet_cfg.notice_days)
+    notice = timedelta(days=config.fleet_notice_days)
     service_dates = config.batch.service_dates
     vehicles = sorted(reference.vehicles, key=lambda v: v.vehicle_id)
     depot_ids = sorted(d.depot_id for d in reference.depots)

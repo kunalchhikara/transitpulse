@@ -194,5 +194,6 @@ transfers_per_day = 1
 # 6 transfers over a 3-vehicle pool -> at least one vehicle moves >= 2 times.
 relief_pool_size = 3
 # Assignment recorded (`updated_at`) this many days before it takes effect.
-# Must be >= schedules.publish_lead_days when transfers are generated.
+# Must be >= schedules.publish_lead_days (applies to INITIAL rows too, so even
+# when transfers are off). Omit to default to publish_lead_days.
 notice_days = 21

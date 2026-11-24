@@ -457,7 +457,7 @@ behavioural number is hardcoded in generator code.
 | `[disruptions]` | `per_day` (exact count), severity weights + delay-impact ranges, disruption types (`effect` = `DELAY` / `BREAKDOWN` / `CANCEL`, weight, duration range). |
 | `[passengers]` | journeys-per-trip range (capped at vehicle capacity), card population, settlement lag, fare types (weight + flat fare). |
 | `[weather]` | `enabled`, observation interval (must divide 1440), temperature/rain/wind/cloud parameters and condition thresholds. |
-| `[fleet_changes]` (DE-10) | `enabled`, `transfers_per_day` (exact count per later service date), `relief_pool_size` (sub-fleet transfers are drawn from; must be >= `transfers_per_day`), `notice_days` (record lead; must be >= `publish_lead_days` when transfers are generated). Section optional: absent = disabled. |
+| `[fleet_changes]` (DE-10) | `enabled`, `transfers_per_day` (exact count per later service date), `relief_pool_size` (sub-fleet transfers are drawn from; must be >= `transfers_per_day`), `notice_days` (record lead for INITIAL and TRANSFER rows; must be >= `publish_lead_days` whether or not transfers are generated; omitted = `publish_lead_days`). All keys optional: an absent section or `enabled = false` alone = disabled. |
 
 Exact volume formulas (verified by `simulator/tests/test_batch_volume.py`):
 
@@ -784,8 +784,9 @@ Transfer model (`simulator/batch/fleet.py`, config `[fleet_changes]`):
   `event_date`, a service-date boundary) until the same vehicle's next row;
   every trip / schedule / trip-scoped disruption with that vehicle on a
   service date is attributed to the depot effective on its `event_date`.
-- `updated_at` = `effective_from` - `notice_days`. Validation requires
-  `notice_days >= publish_lead_days` when transfers are generated, so a
+- `updated_at` = `effective_from` - `notice_days` (omitted =
+  `publish_lead_days`). Validation requires `notice_days >= publish_lead_days`
+  for every row, INITIAL included (so even with transfers off), so a
   published timetable never attributes a depot that was not yet recorded. Per
   vehicle, `updated_at` increases with the effective date: the generated log
   has no backdated changes (DE-13 still needs a backdating policy for real

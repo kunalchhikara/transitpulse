@@ -200,7 +200,7 @@ def test_change_history_is_well_formed(tables):
 def test_effective_from_is_local_midnight_and_updated_at_follows_notice():
     cfg = load_batch_config()
     offset = cfg.batch.utc_offset_hours
-    notice = timedelta(days=cfg.fleet_changes.notice_days)
+    notice = timedelta(days=cfg.fleet_notice_days)
     publish_lead = timedelta(days=cfg.schedules.publish_lead_days)
     for r in default_datasets().vehicle_depot_assignments:
         midnight = local_midnight_utc(r.event_date, offset)
@@ -431,7 +431,7 @@ def test_default_and_sample_fleet_config():
         {"transfers_per_day": -1},
         {"relief_pool_size": -1},
         {"notice_days": -1},
-        {"notice_days": 13},  # < publish_lead_days (14) while transfers are generated
+        {"notice_days": 13},  # < publish_lead_days (14)
         {"unexpected": 1},
     ],
 )
@@ -440,9 +440,55 @@ def test_inconsistent_fleet_config_rejected(fleet):
         with_overrides(load_batch_config(), fleet_changes=fleet)
 
 
-def test_notice_rule_only_applies_when_transfers_are_generated():
-    with_overrides(load_batch_config(), fleet_changes={"enabled": False, "notice_days": 0})
-    with_overrides(load_batch_config(), fleet_changes={"transfers_per_day": 0, "notice_days": 0})
+@pytest.mark.parametrize(
+    "fleet",
+    [
+        {"enabled": False, "notice_days": 0},
+        {"transfers_per_day": 0, "notice_days": 0},
+    ],
+)
+def test_notice_rule_applies_even_without_transfers(fleet):
+    """QA of PR #14 (D1): INITIAL rows are attributed by timetables published
+    `publish_lead_days` ahead, so the notice rule holds whether or not any
+    transfer is generated."""
+    with pytest.raises(ValidationError, match="notice_days"):
+        with_overrides(load_batch_config(), fleet_changes=fleet)
+
+
+def _section_variants():
+    data = load_batch_config().model_dump(mode="python")
+    absent = {k: v for k, v in data.items() if k != "fleet_changes"}
+    only_disabled = {**data, "fleet_changes": {"enabled": False}}
+    return {"absent": absent, "only_enabled_false": only_disabled}
+
+
+@pytest.mark.parametrize("variant", ["absent", "only_enabled_false"])
+def test_disabled_without_explicit_values_is_accepted_and_byte_identical(tmp_path, variant):
+    """QA of PR #14 (D2): `[fleet_changes] enabled = false` alone is accepted,
+    exactly like an absent section, and both reproduce pre-DE-10 output."""
+    cfg = BatchConfig.model_validate(_section_variants()[variant])
+    assert cfg.fleet_changes == FLEET_CHANGES_DISABLED
+    scale = load_scale_config()
+    datasets, _ = generate(cfg, scale)
+    assert _written_sha256(datasets, cfg, scale, tmp_path) == PRE_DE10_DEFAULT_SHA256
+
+
+@pytest.mark.parametrize("variant", ["absent", "only_enabled_false"])
+def test_initial_rows_recorded_before_timetable_publication_when_disabled(variant):
+    """QA of PR #14 (D1): with no explicit notice, every INITIAL row is
+    recorded no later than the timetable that attributes trips to it."""
+    cfg = BatchConfig.model_validate(_section_variants()[variant])
+    assert cfg.fleet_notice_days == cfg.schedules.publish_lead_days
+    offset = cfg.batch.utc_offset_hours
+    publish_lead = timedelta(days=cfg.schedules.publish_lead_days)
+    datasets, reference = generate(cfg, load_scale_config())
+    rows = datasets.vehicle_depot_assignments
+    assert len(rows) == len(reference.vehicles)
+    for r in rows:
+        assert r.change_type == AssignmentChangeType.INITIAL
+        midnight = local_midnight_utc(r.event_date, offset)
+        assert r.updated_at < r.effective_from
+        assert r.updated_at <= midnight - publish_lead
 
 
 def test_pool_larger_than_fleet_fails_loudly():
