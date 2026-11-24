@@ -35,3 +35,11 @@ architecture.
   and why, and whether it belongs in Lakehouse, Warehouse, or both.
 - Reconciliation must satisfy: source extracted = valid loaded + quarantined +
   intentionally excluded (`PROJECT.md` section 15).
+
+## Amendment (2026-11-24, ADR-0006)
+"Fed from Gold" is refined for batch data: Warehouse dimensions and batch
+facts are loaded from the Silver batch current-state tables (DE-12); the
+Warehouse dimensional model is itself the curated (Gold) representation of
+the batch data, so no extra Lakehouse Gold copy of those rows is made.
+`fact_route_performance` is still loaded from the Lakehouse Gold
+route-performance aggregate (DE-07). See ADR-0006.

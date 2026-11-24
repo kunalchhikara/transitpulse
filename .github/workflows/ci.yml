@@ -38,6 +38,21 @@ jobs:
         if: hashFiles('simulator/**/*.py') != ''
         run: pytest simulator -q
 
+  sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: hashFiles('sql/**/*.sql') != ''
+        with:
+          python-version: "3.11"
+      - name: Install sqlfluff (pinned, CI-only; see ADR-0006)
+        if: hashFiles('sql/**/*.sql') != ''
+        run: pip install sqlfluff==4.4.0
+      - name: T-SQL syntax check (sqlfluff parse, tsql dialect)
+        if: hashFiles('sql/**/*.sql') != ''
+        run: sqlfluff parse --dialect tsql sql
+
   website:
     runs-on: ubuntu-latest
     steps:
