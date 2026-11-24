@@ -9,9 +9,11 @@ Bronze/Silver/Gold transformation logic that can be tested without Fabric, per
 
 Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
 (Deterministic Simulator Core Engine), DE-03 (Incident Injection Scenarios in
-Simulator), DE-04 (Synthetic Batch & Historical Datasets) and DE-05 (Local
-Bronze Layer Ingestion Logic) implemented. Remaining scope (Silver/Gold) is
-not yet implemented — see `docs/BACKLOG.md` (DE-06..DE-07).
+Simulator), DE-04 (Synthetic Batch & Historical Datasets), DE-05 (Local
+Bronze Layer Ingestion Logic) and DE-06 (Local Silver Layer for the telemetry
+stream) implemented, all local only (IMPLEMENTED - NOT CONNECTED). Remaining
+scope (Gold, DE-07; Silver for the DE-04 batch datasets) is not yet
+implemented — see `docs/BACKLOG.md`.
 
 ## Dependency choice: Pydantic
 
@@ -1038,3 +1040,418 @@ over unchanged:
 - Run order in `read_table` is by (`ingestion_time`, `run_id`); manifests
   record input paths as given on the command line.
 - No retention/compaction of old run partitions.
+
+## DE-06: Local Silver Layer (telemetry stream)
+
+**Status: IMPLEMENTED - NOT CONNECTED.** `simulator/silver/` is local Python
+reading the local DE-05 Bronze store and writing local files. No Fabric
+Lakehouse, OneLake, Eventstream, Eventhouse or other Azure/Fabric resource
+has been created, read or written; nothing here is evidence of Fabric
+execution. "Mapping to Fabric" below records how it is meant to carry over.
+
+**Scope:** the DE-02/DE-03 telemetry stream in Bronze (`telemetry_stream`).
+Silver for the DE-04 batch datasets (`historical_trips`,
+`service_disruptions`, ...) is **out of scope for DE-06**; Bronze batch runs
+in the same store are simply not consumed.
+
+Silver (PROJECT.md section 8, ADR-0002) is where every section 12 rule is
+enforced: each Bronze record ends up in exactly one of three buckets - a
+typed, enriched **clean** record; a **quarantine** record holding the raw
+payload losslessly plus why it was rejected; or an excluded, audited
+**duplicate** - and the run commits only if the counts reconcile.
+
+### CLI usage
+
+```
+python -m simulator.incidents --enable-malformed --enable-duplicate --enable-late-event \
+  --enable-out-of-order --max-events 500 --output events.ndjson --log-file incidents.log
+python -m simulator.bronze stream --input events.ndjson --run-id b1
+python -m simulator.silver --run-id s1
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--run-id ID` | generated (`silver-<UTC>-<8 hex>`) | Silver run identifier (same alphabet as Bronze run ids). Pass one for reproducible/idempotent reruns. |
+| `--bronze-dir PATH` | config `bronze_dir` (`simulator/_out/bronze`) | Bronze store root. |
+| `--output-dir PATH` | config `output_dir` (`simulator/_out/silver`, gitignored) | Silver store root. |
+| `--bronze-run-id ID` (repeatable) | every committed run holding `bronze_table` | Consume only these committed Bronze runs (processed in Bronze commit order, never CLI order). |
+| `--fixed-processing-time ISO` | wall clock | Inject a fixed clock (must carry an offset) for byte-reproducible output. |
+| `--silver-config PATH` | `simulator/silver/default_silver.toml` | Alternate Silver config. |
+| `--validation-config PATH` | DE-01 `simulator/config/default_validation.toml` | Alternate section 12 thresholds. |
+| `--scale-config PATH` | DE-01 `default_scale.toml` | Reference data used for the known-route rule and enrichment. |
+| `--log-file PATH` / `--log-level LEVEL` | stderr / `INFO` | Structured JSON-lines logs (DE-02 formatter, logger `simulator.silver`). |
+
+Stdout gets one JSON summary line (`status`, `run_id`, `manifest`,
+`bronze_runs_consumed`, the main counters, `quarantined_by_rule`,
+`reconciliation_holds`; or `status: FAILED`, `error_type`, `error`). Exit code
+0 = committed or already committed with identical input; 1 = refused/failed
+(nothing committed). Library API: `simulator.silver.run_silver(...)`.
+
+### Input: committed Bronze runs only
+
+Silver follows the DE-05 read contract (BACKLOG DE-06): Bronze is read only
+through committed run manifests (`BronzeStore.committed_manifests()` and each
+manifest's `tables[telemetry_stream].path`, exactly what
+`committed_partition_files` uses) - never by globbing - so an orphaned
+partition of a crashed Bronze run or a `FAILED` run is invisible. Each data
+file is verified against its manifest (sha256, line count = `records_written`,
+`run_id`, and increasing `_bronze_line_number` per source file) before use; a
+mismatch fails the Silver run loudly. The consumed runs (run_id,
+ingestion_time, path, sha256, records, `replay_of`) are recorded in the
+Silver manifest's `bronze_runs_consumed`.
+
+**Arrival order** = Bronze run order (`ingestion_time`, then `run_id`) and,
+within a run, physical line order of its data file (input-file order, then
+`_bronze_line_number`). It is recorded per record as `_silver_arrival_seq`.
+
+### Bucket ordering
+
+For each Bronze record, in arrival order:
+
+1. Bronze parse-error record -> **quarantine**, rule `bronze_parse_error`
+   (the Bronze code, e.g. `invalid_json`, is kept in the reason and in
+   `bronze_parse_error`). Never dropped.
+2. Validate against the rule catalogue -> any failure: **quarantine**.
+3. Valid and its `event_id` was already loaded in this Silver run ->
+   **duplicate** (excluded, counted, written to the duplicates audit table).
+4. Valid and first -> **clean**, classified by the event-time watermark as
+   `in_order` / `out_of_order` / `late` (late is loaded and flagged).
+
+**Validate-then-dedup** (not dedup-then-validate) is deliberate: a corrupt
+copy must never "claim" an event_id and cause a later good copy of the same
+event to be discarded as a duplicate, and the quarantine table stays a
+complete audit of every rejected *delivery* (a replayed corrupt message is
+quarantined each time it arrives). Duplicates are therefore always valid
+repeats, which is exactly what "no downstream double-counting" protects.
+
+### Rule catalogue (PROJECT.md section 12)
+
+Precedence is the table order. Thresholds come from DE-01's
+`ValidationThresholds` (`simulator/config/default_validation.toml`); Silver
+does not duplicate them.
+
+| # | Rule id | Category | PROJECT.md section 12 rule | Check (default) | DE-03 mode that triggers it |
+|---|---|---|---|---|---|
+| 0 | `bronze_parse_error` | parse | (invalid events must not silently disappear) | Bronze could not store the line as a JSON object | - (any truncated/garbage line) |
+| 1 | `supported_schema_version` | schema | supported schema version | `schema_version` in `supported_schema_versions` (`["1.0.0"]`); a failure short-circuits | - |
+| 2 | `required_fields` | schema | required event_id/vehicle_id | every `required_fields` entry (all 14 section 6 fields) present, not null, not a blank string | `null_vehicle_id`, `missing_field` |
+| 3 | `parsable_timestamps` | schema | parsable timestamps | `generated_at`/`event_time` are ISO-8601 date-time strings **with a UTC offset** | `malformed_timestamp` |
+| 4 | `schema_conformance` | schema | (type enforcement, section 8) | strict `TelemetryEvent`: JSON types not coerced, `status` enum, no unknown fields, float fields finite (a number overflowing float64, e.g. `1e400` -> inf, is rejected here regardless of thresholds) | - |
+| 5 | `valid_coordinates` | rule | valid latitude/longitude | latitude in [-90, 90], longitude in [-180, 180] | `invalid_coordinates` |
+| 6 | `non_negative_speed` | rule | nonnegative speed | `speed_kmh >= 0` and `>= min_speed_kmh` (0) | `negative_speed` |
+| 7 | `max_speed` | rule | configurable upper-speed threshold | `speed_kmh <= max_speed_kmh` (120) | - |
+| 8 | `non_negative_occupancy` | rule | nonnegative occupancy | `occupancy >= 0` and `>= min_occupancy` (0) | - |
+| 9 | `max_occupancy` | rule | nonnegative occupancy (configured upper bound) | `occupancy <= max_occupancy` (150) | - |
+| 10 | `heading_range` | rule | (DE-01 threshold beyond section 12) | heading in [0, 360) and [`min_heading_degrees`, `max_heading_degrees`] (0, 359.9) | - |
+| 11 | `known_route` | rule | known route where applicable | `route_id` is a DE-01 reference route (when `require_known_route`) | `unknown_route` |
+| 12 | `future_time_tolerance` | rule | future-time tolerance | `event_time <= generated_at + future_time_tolerance_seconds` (120) | - |
+
+**Schema failure vs rule failure vs parse error** (the section 12/15
+counters): a *parse error* is a line Bronze could not store as a JSON object;
+a *schema failure* is a JSON object that does not conform to the telemetry
+contract's shape/types (rules 1-4); a *rule failure* is a structurally valid
+event that violates a data-quality/business rule (rules 5-12). A record is
+counted under the category of its primary (first) rule, so
+`quarantined == parse_errors + schema_failures + rule_failures`.
+
+**All failing rules are recorded, within the stage that rejected the record.**
+Validation has two stages. Stage 1 (structural: rules 1-4 plus the field
+bounds DE-01 puts on `TelemetryEvent`, which map to rules 5, 6, 8 and 10) is
+evaluated on the record's exact source text with
+`TelemetryEvent.model_validate_json(..., strict=True)`; pydantic reports every
+failing field at once and each error is mapped to its rule. Stage 2 runs only
+if stage 1 passed (the business rules need a typed event) and calls DE-01's
+`validate_against_thresholds` **unchanged**; each reason it returns is mapped
+to a rule id via `simulator.silver.rules.THRESHOLD_REASON_RULES`, and an
+unmapped reason raises `ValidationContractError` rather than producing an
+unlabelled rejection (tested against every DE-01 reason). So a record with a
+negative speed *and* an unknown route is quarantined as `non_negative_speed`
+only; one with two threshold failures lists both. The quarantine record keeps
+`rejection_rules` (all, in precedence order), `primary_rule` (the first, used
+for `quarantined_by_rule`, which therefore sums to `quarantined`) and
+`rejections` (rule, category, human-readable reason with the offending
+value); `rule_violations` in the manifest counts every rule hit.
+
+**Divergences from DE-01, and why:** (a) the schema-version gate runs first,
+on the raw value - the version decides which contract applies, so an
+unknown-version record would otherwise be reported as a pile of misleading
+structural errors; (b) timestamps must carry a UTC offset - DE-01's helper
+assumes UTC for a naive value, which would silently shift a Sydney local time
+by 10-11 hours, and a bare epoch number (even inside a string) is not
+ISO-8601; (c) strict typing - `"12.5"` is not coerced to a speed and `5.5` is
+not truncated to an occupancy (PROJECT.md section 8 "type enforcement").
+
+### Future-time reference
+
+`future_time_tolerance_seconds` is measured against the event's own
+**`generated_at`** by default (`future_time_reference = "generated_at"`): an
+event cannot be observed after the message carrying it was produced, so
+`event_time > generated_at + tolerance` identifies a corrupted or clock-skewed
+reading. This was chosen over the wall clock / `processing_time` (simulated
+timelines start in 2025, so a wall-clock check would never fire on replayed
+data, and results would depend on *when* Silver runs - neither replayable nor
+byte-reproducible) and over Bronze `ingestion_time` (also a wall clock: a
+stream simulated with a future `simulated_start_time` would be quarantined
+wholesale). `future_time_reference = "ingestion_time"` is available for live
+feeds, where it additionally catches a producer whose whole clock
+(`generated_at` included) runs fast. A late event is never a future-time
+failure.
+
+### Deduplication policy
+
+Key: the exact `event_id` string. Scope: every Bronze run consumed by the
+Silver run (so a DE-05 `--allow-replay` run, or the same event re-sent in a
+later file, is excluded - tested). Winner: the **first valid arrival** (Bronze
+run order, then line order). Each excluded copy is written to the duplicates
+table with its own lineage, the kept copy's lineage, its payload sha256 and
+`payload_matches_kept`; a same-id-different-payload copy also increments
+`duplicate_payload_conflicts`. Dedup state is exact and unbounded within a
+run (local scale) - stronger than Spark's watermark-bounded state.
+
+### Event time, watermark, late and out-of-order policy
+
+`processing_time` is stamped once per Silver run from the injectable clock
+(like Bronze's `ingestion_time`); `event_time` is the reading's own time;
+`ingestion_time` is carried from Bronze. Event-time state is a watermark over
+valid, first-seen events in arrival order:
+
+```
+watermark = max(event_time of valid, non-duplicate events seen so far) - allowed_lateness_seconds  (default 60)
+event_time >= max seen               -> in_order
+watermark <= event_time < max seen   -> out_of_order  (accepted, flagged, counted)
+event_time <  watermark              -> late          (LOADED, flagged, counted - never dropped)
+```
+
+Only valid, non-duplicate events advance the maximum: a corrupt future
+timestamp must not make every later event "late", and a replay must not move
+time. **Late events are loaded and flagged rather than routed to a separate
+bucket** because they are valid observations (section 12 forbids invalid
+events silently disappearing; late ones are not even invalid), historical/
+batch Gold (DE-07, Warehouse) should include them, and a streaming aggregate
+whose window has already closed can exclude them with one predicate on
+`_silver_event_time_status`. Each clean record carries
+`_silver_event_time_status`, `_silver_lateness_seconds` (max seen minus
+event_time; 0 when in order) and `_silver_watermark` (the watermark at
+arrival). The default lateness (60 s) matches DE-03's documented consumer
+threshold (`late_threshold_seconds`) but is Silver's own setting. The
+watermark is evaluated per record (a micro-batch of one); a Spark job
+evaluates it per micro-batch (see the mapping below).
+
+### Enrichment and standardisation (clean table)
+
+Clean records hold the 14 section 6 fields **in DE-01 contract order** in a
+standardised typed form: timestamps rewritten to UTC ISO-8601 with
+microseconds and `Z` (`2025-01-01T11:00:00.5+11:00` ->
+`2025-01-01T00:00:00.500000Z`; the instant never changes; sub-microsecond
+digits are truncated by Python's datetime); float fields as JSON floats (an
+integer speed `12` becomes `12.0`); `status` as its enum string. Values are
+otherwise unchanged. Enrichment from DE-01 reference data is added in clearly
+named `ref_*` columns and never overwrites an original field:
+`ref_route_number`, `ref_route_name`, `ref_vehicle_home_depot_id` (null, and
+counted in `enrichment_misses`, for a vehicle not in the reference data - an
+unknown vehicle is not a section 12 rule). Then lineage (`ingestion_time`,
+`source`, `bronze_run_id`, `_bronze_source_file`, `_bronze_line_number`),
+`silver_run_id`, `processing_time` and the `_silver_*` event-time columns.
+
+### Quarantine record (lossless)
+
+`silver_run_id`, `processing_time`, `ingestion_time`, `source`,
+`bronze_run_id`, `_bronze_source_file`, `_bronze_line_number`,
+`_silver_arrival_seq`, `primary_rule`, `rejection_category`,
+`rejection_rules`, `rejections`, `event_id` (when it is a string), and the raw
+payload:
+
+| `raw_format` | `raw_payload` | `raw_payload_text` / `raw_encoding` |
+|---|---|---|
+| `json_object` | the original object (Bronze metadata stripped), key order kept | the **exact original text** of the object (the Bronze line minus its spliced metadata, recovered and verified against the record), `utf-8` |
+| `bronze_parse_error` | null | Bronze's `_bronze_raw_line` / `_bronze_raw_encoding` (`base64` for non-UTF-8), plus `bronze_parse_error` / `bronze_parse_error_detail` |
+
+So the original input bytes are always recoverable (number spellings such as
+`-1.50`/`1e2`, escapes, big integers and invalid UTF-8 included - tested).
+Bronze itself trims JSON whitespace at the line ends (DE-05 contract).
+
+Valid JSON syntax that strict UTF-8 JSON output cannot represent - a number
+overflowing float64 (`1e400` parses to inf) or a lone surrogate escape
+(`"\ud800"`), in any field or key - is still quarantined, never aborts the
+run: `raw_payload` is null, `raw_payload_omitted_reasons` lists why
+(`non_finite_number`, `unpaired_surrogate`; `[]` otherwise), `event_id` is
+null if it holds a lone surrogate, and `raw_payload_text` (ASCII escapes) keeps
+the exact original (PR #10 QA D1/D2, tested).
+
+### Output layout
+
+```
+<output_dir>/                                         (default simulator/_out/silver, gitignored)
+  telemetry_clean/run_id=<id>/part-00000.jsonl        valid, deduplicated, typed, enriched
+  telemetry_quarantine/run_id=<id>/part-00000.jsonl   every rejected record + raw payload + reasons
+  telemetry_duplicates/run_id=<id>/part-00000.jsonl   excluded duplicate copies (lineage only)
+  _runs/<id>.json                                     run manifest: audit record AND commit marker
+  _staging/<id>/...                                   in-flight run, never read, removed on finish
+```
+
+The commit protocol reuses DE-05's layer-agnostic `BronzeStore` primitives by
+import (staging, atomic directory rename, manifest written last): **a Silver
+run is committed iff `_runs/<id>.json` says `COMMITTED`**. Each Silver run is
+a complete snapshot of the Bronze runs it consumed; dedup and watermark state
+are scoped to the run, so consumers (DE-07) read one committed Silver run.
+
+### Run manifest and PROJECT.md section 15 counters
+
+`_runs/<id>.json` (sorted keys): `run_id`, `status`, `processing_time`,
+`started_at`/`ended_at`/`duration_seconds`, `input_fingerprint`,
+`previous_attempts` (failed attempts of this run_id - the FU-03 audit trail,
+kept from the start in Silver), `bronze_table`, `bronze_selection`
+(`all_committed`/`explicit`), `bronze_runs_consumed` (with
+`bronze_to_silver_latency_seconds` = processing_time - Bronze
+ingestion_time), `config`, `validation_thresholds`, `reference_sha256`,
+`rule_catalogue`, `tables` (path, sha256, records), `event_time` (lateness,
+reference, min/max event_time, final watermark), `reconciliation`,
+`removed_uncommitted_paths`, `error`, and `counters`:
+
+| Counter | Meaning |
+|---|---|
+| `extracted` | Bronze records read (section 15 "received" / "source extracted") |
+| `valid_loaded` | written to the clean table |
+| `quarantined` | written to the quarantine table |
+| `duplicates_excluded` | valid repeats excluded (section 15 "duplicates") |
+| `duplicate_payload_conflicts` | duplicates whose payload differed from the kept copy |
+| `in_order` / `out_of_order` / `late` | event-time status of `valid_loaded` (section 15 "late events") |
+| `parse_errors` / `schema_failures` / `rule_failures` | quarantined, by primary-rule category (section 12 "schema-failure counts") |
+| `quarantined_by_rule` | quarantined, by primary rule (sums to `quarantined`) |
+| `rule_violations` | every rule hit (a record can hit several) |
+| `parse_errors_by_code` | Bronze parse-error codes |
+| `enrichment_misses` | clean records whose route/vehicle is not in the reference data |
+| `quality_percentage` | `100 * valid_loaded / (valid_loaded + quarantined)`, 4 dp; null when there is nothing to judge. Duplicates are left out of the denominator: a replay is a delivery issue, not a data-quality failure. |
+| `throughput_records_per_second` | `extracted / duration_seconds` (null under a fixed clock, where the duration is 0) |
+
+The data is synthetic (no PII); the quarantine store is local only.
+
+### Reconciliation identity (for later Fabric reuse)
+
+Asserted in code before commit (`simulator.silver.pipeline.reconcile`) from
+independently obtained numbers - bucket counters incremented at
+classification, the Bronze manifests' record counts, and the lines actually
+written to each staged file - and recorded in `reconciliation`
+(`identities`, `checks`, `holds`, and the evaluated `formula`). Any failure
+raises `SilverAccountingError`; nothing is committed and a `FAILED` manifest
+records which check failed.
+
+```
+extracted    == valid_loaded + quarantined + duplicates_excluded    (section 15; "intentionally excluded" = duplicates)
+extracted    == sum(bronze_runs_consumed[].records)                  (Bronze -> Silver hand-off; continues DE-05's records_written)
+quarantined  == parse_errors + schema_failures + rule_failures == sum(quarantined_by_rule)
+valid_loaded == in_order + out_of_order + late                       (late is a flag on loaded data, not a bucket)
+lines on disk per table == valid_loaded / quarantined / duplicates_excluded
+```
+
+Together with DE-05 this gives the end-to-end chain: input lines ->
+`records_written` (Bronze) -> `extracted` -> three Silver buckets.
+
+### Idempotency and reruns
+
+| Situation | Behaviour |
+|---|---|
+| Same run_id, same input fingerprint, committed | No-op: `ALREADY_COMMITTED`, nothing written (byte-identical even under a later clock). |
+| Same run_id, different fingerprint (Bronze runs and their sha256, Silver config, thresholds, reference data) | Refused: `SilverRunIdConflictError`. A committed run is never overwritten. |
+| Same run_id after a `FAILED`/crashed attempt | Retried from scratch: orphaned staging/partitions removed (`removed_uncommitted_paths`); the failed attempt is kept in `previous_attempts`. |
+| New run_id | A new, independent snapshot (same data apart from `silver_run_id`/`processing_time`). |
+
+Same Bronze inputs + same Silver run_id + fixed clock -> byte-identical
+tables and manifest in any store, in-process or across separate CLI
+processes (tested). Manifests never record local filesystem paths (BACKLOG
+FU-04): Bronze paths are relative to the Bronze root and store roots are not
+recorded.
+
+### Configuration: `simulator/silver/default_silver.toml`
+
+Validated by `simulator/silver/config.py` (pydantic, unknown keys rejected):
+`output_dir`, `bronze_dir`, `bronze_table`, `clean_table`,
+`quarantine_table`, `duplicates_table` (distinct, Bronze table-name
+alphabet), `allowed_lateness_seconds`, `future_time_reference`
+(`generated_at`/`ingestion_time`), `max_logged_rejections` (caps per-record
+warning log lines; every rejection is still counted and written). Section 12
+thresholds stay in DE-01's `default_validation.toml`.
+
+### Mapping to Fabric
+
+Not implemented or connected - the intended translation once the Fabric trial
+is active (ADR-0004):
+
+| Local (DE-06) | Fabric equivalent |
+|---|---|
+| Read committed Bronze runs via manifests | Read the `bronze_telemetry_stream` Delta table (only committed transactions are visible); incremental runs via Delta change data feed or Structured Streaming with a checkpoint. |
+| Strict `TelemetryEvent` validation + rule mapping | `from_json` with an explicit schema + `columnNameOfCorruptRecord`, then one boolean column per rule and an array column of failed rule ids, in a PySpark notebook. |
+| Validate-then-dedup, first arrival wins | Split valid/invalid, then `dropDuplicates(["event_id"])` (or `dropDuplicatesWithinWatermark`) on the valid stream; in batch, `row_number()` over `event_id` ordered by ingestion time and source position. |
+| Event-time watermark, late flagged | `withWatermark("event_time", "60 seconds")` for stateful windows. Spark silently drops late rows inside stateful operators, which section 12 forbids, so late rows are flagged (compare with the max event_time per micro-batch in `foreachBatch`) or routed to a late table before aggregation. Eventhouse/KQL equivalent: `ingestion_time()` vs event time. |
+| Quarantine JSONL | `silver_telemetry_quarantine` Delta table (raw `value` column kept), appended in the same job. |
+| Duplicates audit JSONL | `silver_telemetry_duplicates` Delta table, or counts only in the run-audit table. |
+| `ref_*` enrichment | Broadcast join with route/vehicle reference tables. |
+| Manifest + reconciliation assert | `silver_run_audit` Delta table; the notebook raises before the Delta commit if the identity fails. |
+| Staging + rename + manifest commit marker | The Delta transaction (with `txnAppId`/`txnVersion` for idempotent reruns). |
+
+### DE-06 tests
+
+`pytest simulator -q` includes 136 Silver tests:
+
+- `test_silver_rules.py` - a negative and a positive (boundary) case for every
+  section 12 rule and the extra rules; configurability of every threshold via
+  DE-01 `ValidationThresholds`; future-time reference behaviour; all failing
+  rules recorded in precedence order; every DE-01 reason mapped, an unmapped
+  one fails loudly.
+- `test_silver_quarantine.py` - every Bronze parse-error code routed to
+  quarantine with its code and exact raw bytes (base64 for invalid UTF-8);
+  section 12 quarantine metadata; byte-exact raw payload for unusual JSON
+  spellings; each rule lands in quarantine and is counted; schema vs rule vs
+  parse counters.
+- `test_silver_dedup.py` - within-run duplicates; a DE-05 `--allow-replay`
+  run does not double-count; Bronze commit order decides the winner;
+  conflicting payloads; validate-then-dedup behaviour.
+- `test_silver_event_time.py` - watermark boundaries; late loaded and flagged
+  with the right lateness/watermark; out-of-order within lateness; an invalid
+  future event does not poison the watermark; processing vs event vs
+  ingestion time.
+- `test_silver_reconciliation.py` - the identity vs independently computed
+  counts and record-level lineage coverage; a dropped input record and an
+  unwritten output record each fail loudly with nothing committed; the Bronze
+  read contract (orphan partitions, FAILED runs, batch runs, tampered
+  partition, explicit selection).
+- `test_silver_idempotency.py` - byte-identical output (in-process and two
+  CLI processes), no-op rerun, conflicts, failed-attempt retry with
+  `previous_attempts`, crash leftovers, no absolute paths in manifests.
+- `test_silver_scenarios.py` - each DE-03 scenario on its own: every
+  malformed mode -> its rule; duplicates excluded; late events loaded and
+  flagged exactly as injected; out-of-order accepted; congestion, volume
+  spike and breakdown stay valid (with their degraded values) and recover.
+- `test_silver_end_to_end.py` - all seven DE-03 scenarios at once -> Bronze
+  (plus a deliberate replay run and a run of unparseable lines) -> Silver,
+  asserted against counts derived independently from the DE-03 structured
+  incident log and a clean DE-02 generator (`_silver_helpers.
+  derive_expectations`, which uses no Silver code); and the same through the
+  three real CLIs as separate processes.
+- `test_silver_cli.py` - CLI commit/no-op/failure exit codes, alternate
+  validation config, config validation, clean-record standardisation and
+  enrichment.
+
+### Known limitations (DE-06)
+
+- **Not connected to Fabric** (see status above); local filesystem only.
+- **Telemetry stream only.** Silver for the DE-04 batch datasets (and the
+  FU-02 out-of-order `updated_at` handling there) is not implemented.
+- **Full recompute per Silver run.** Each run re-reads its selected Bronze
+  runs; dedup/watermark state is not carried between Silver runs (no
+  checkpoint). Selecting a subset of Bronze runs dedups only within that
+  subset - consumers must read one Silver run, not union several.
+- **Stage-2 rules are not evaluated for a structurally invalid record**, so
+  `rejection_rules` is complete only within the failing stage (see above).
+- **No service-area (bounding box) GPS check.** `valid_coordinates` is the
+  global lat/lon range; "null island" (0, 0) would pass. A configurable
+  Sydney bounding-box rule is a candidate follow-up.
+- **DE-03 duplicate injection replaces the event it fires on**
+  (`IncidentInjector._apply_duplicate` returns the replay instead of the new
+  payload, which is only remembered), so that new event can be missing from
+  the stream, or first arrive later as a "replay". Silver handles both
+  correctly and the test oracle accounts for it; recorded for the DE-03
+  owner.
+- Single writer per Silver store (no locking); inputs read fully into memory;
+  per-record (not micro-batch) watermark; timestamps truncated to
+  microseconds.

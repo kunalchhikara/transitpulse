@@ -1,0 +1,39 @@
+# Default DE-06 Silver configuration (simulator/silver/config.py).
+# Every operational knob of the local Silver layer lives here rather than in
+# code, per PROJECT.md section 19. Validation *thresholds* (max speed,
+# occupancy bounds, future-time tolerance, supported schema versions,
+# required fields, known-route switch) are NOT repeated here: they come from
+# DE-01's simulator/config/default_validation.toml (or --validation-config),
+# so there is exactly one source of truth for PROJECT.md section 12 values.
+
+[silver]
+# Root of the local Silver store. Under the gitignored simulator/_out/.
+output_dir = "simulator/_out/silver"
+# Root of the local Bronze store Silver reads (DE-05 default output_dir).
+bronze_dir = "simulator/_out/bronze"
+# Bronze table holding the DE-02/DE-03 telemetry stream (DE-05 stream.table).
+bronze_table = "telemetry_stream"
+
+# Silver output tables (directories in the Silver store).
+clean_table = "telemetry_clean"
+quarantine_table = "telemetry_quarantine"
+duplicates_table = "telemetry_duplicates"
+
+# Event-time watermark: watermark = (max valid event_time seen so far, in
+# arrival order) - allowed_lateness_seconds. A valid, first-seen event whose
+# event_time is behind the watermark is LATE (loaded, flagged, counted).
+# 60 s matches DE-03's documented consumer late threshold
+# (incidents.late_event.late_threshold_seconds), but is owned here: producer
+# config never drives consumer policy.
+allowed_lateness_seconds = 60
+
+# What the PROJECT.md section 12 future-time tolerance is measured against:
+#   "generated_at"   - the event's own producer timestamp (default; same
+#                      clock domain as event_time, deterministic on replay)
+#   "ingestion_time" - the Bronze ingestion_time (wall clock at ingestion;
+#                      meaningful for live feeds, see README DE-06)
+future_time_reference = "generated_at"
+
+# Cap on per-record rejection WARNING log lines per run (every rejection is
+# still counted in the manifest and written to the quarantine table).
+max_logged_rejections = 100

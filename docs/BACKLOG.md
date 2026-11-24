@@ -286,6 +286,11 @@ event_count, valid_percentage), CSV/JSON output.
 SQL, Power BI, vehicle/trip/passenger/incident-level Gold facts (reserved for
 the later full Warehouse story).
 **Dependencies:** DE-06.
+**Silver input contract (from QA of PR #10):** Silver loads late events and
+flags them (`_silver_event_time_status`), so "valid" includes late rows.
+Historical Gold aggregates must include late rows — never filter them out
+by default (only closed streaming windows may). Read Silver through its
+committed run manifests, as Silver reads Bronze.
 **Acceptance criteria:** aggregate matches hand-computed expected values on a
 known fixture; quarantined/duplicate records excluded; deterministic given
 deterministic upstream inputs.
@@ -330,3 +335,28 @@ note prevents overclaiming, handover.
   clean (basename only) and `simulator/_out/` is gitignored, but any
   manifest copied into RECORDED/DEMO evidence or the website must be
   sanitised first. Source: QA of PR #9 (DE-05).
+- **FU-05 (bug): DE-03 duplicate injection drops original events.**
+  `IncidentInjector._apply_duplicate` returns the replayed payload *instead
+  of* the current one, so each duplicate fire silently loses one original
+  event (Lead-verified: 300 events, 14 fires, 286 distinct ids). Fix so
+  duplicates are inserted, not substituted; then update DE-03's duplicate
+  test, `_silver_helpers.run_incident_stream` (mirrors the CLI loop) and the
+  README limitation note. QA of PR #10 simulated the fix: all Silver tests
+  and the independent oracle still pass. Found by the DE-06 developer.
+- **FU-06: Guard the Silver watermark against a future-dated outlier.** One
+  valid event whose `generated_at` and `event_time` are both far in the
+  future advances the watermark and mis-flags most later events as late
+  (QA: 1 outlier turned 259 events late vs 22 baseline). Add a guard (e.g.
+  cap watermark advance by ingestion/processing time, or a max-skew rule)
+  before late flags feed any dashboard. Source: QA of PR #10 (D3).
+- **FU-07: Make quality metrics replay-aware.** Under validate-then-dedup,
+  each Bronze `--allow-replay` re-quarantines the same rejected records, so
+  `quarantined` inflates and `quality_percentage` drops (87.9% → 78.4% after
+  one replay). Add a repeat-rejected-delivery counter (same event_id + raw
+  sha) or compute quality over distinct rejected payloads, and document it,
+  before the Data Quality page uses these numbers. Source: QA of PR #10 (D4).
+- **FU-08: Tighten Silver value bounds and GPS checks.** `delay_seconds` is
+  unbounded (10**30 loads as clean; would overflow int64 in Delta/Warehouse)
+  — add a configurable bound. Add a configurable Sydney bounding-box GPS rule
+  reusing DE-01's `sydney_bounding_box` (currently (0, 0) passes) before
+  geo/map Gold work or Fabric. Source: QA of PR #10 (D5, Q5).
