@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from simulator.generator.clock import FakeClock
+from simulator.generator.runner import run
 from simulator.incidents.config import (
     BreakdownConfig,
     CongestionConfig,
@@ -14,6 +18,7 @@ from simulator.incidents.config import (
     MalformedDataConfig,
     OutOfOrderConfig,
     RecoveryWindow,
+    VolumeSpikeConfig,
 )
 from simulator.tests._generator_helpers import build_generator
 from simulator.tests._incident_helpers import build_injector
@@ -70,11 +75,17 @@ def test_out_of_order_and_late_event_together_do_not_crash_and_conserve_total_co
 
 
 def test_all_seven_scenarios_enabled_at_once_do_not_crash():
-    """The maximal stress case: every DE-03 scenario active simultaneously."""
+    """The maximal stress case: every DE-03 scenario active simultaneously,
+    including volume_spike -- which affects `run()`'s pacing rather than
+    `produce_event()`'s payload content, so this drives the injector
+    through `run()` (exactly as `simulator/incidents/cli.py` does) rather
+    than calling `produce_event()` directly in a loop, so the pacing hook
+    is genuinely exercised here too, not just configured-but-inert."""
     reference = build_generator()
     route_id = reference.produce_event(0).route_id
     vehicle_id = reference.produce_event(5).vehicle_id
 
+    spike_multiplier = 4.0
     injector = build_injector(
         malformed=MalformedDataConfig(enabled=True, probability_per_tick=0.1),
         duplicate=DuplicateConfig(enabled=True, probability_per_tick=0.1),
@@ -86,9 +97,29 @@ def test_all_seven_scenarios_enabled_at_once_do_not_crash():
         breakdown=BreakdownConfig(
             enabled=True, vehicle_ids=[vehicle_id], window=RecoveryWindow(start_tick=0, duration_ticks=60)
         ),
+        volume_spike=VolumeSpikeConfig(
+            enabled=True,
+            window=RecoveryWindow(start_tick=0, duration_ticks=60),
+            rate_multiplier=spike_multiplier,
+        ),
     )
+    base_rate = injector.generator_config.events_per_second
 
-    payloads = [injector.produce_event(tick) for tick in range(60)]
+    payloads: list[object] = []
+    clock = FakeClock()
+    summary = run(injector, payloads.append, clock=clock, max_events=60, rate_multiplier=injector.rate_multiplier)
     payloads += injector.flush_pending()
+
+    assert summary.events_emitted == 60
+    assert len(payloads) == 60 + 3  # hold_ticks pre-fill, nothing lost -- same accounting as the pairwise test above
     for payload in payloads:
         json.dumps(payload, default=str)
+
+    # volume_spike's pacing was genuinely active for the whole window here
+    # (it covers all 60 ticks), not merely accepted-but-unused: the
+    # observed rate must match base_rate * spike_multiplier, not base_rate
+    # alone -- which is what we'd see if the multiplier were silently
+    # ignored while every other scenario is also enabled.
+    observed_rate = summary.events_emitted / summary.elapsed_seconds
+    assert observed_rate == pytest.approx(base_rate * spike_multiplier, rel=1e-6)
+    assert observed_rate > base_rate
