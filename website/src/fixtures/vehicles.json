@@ -1,0 +1,94 @@
+{
+  "asOf": "2026-11-24T08:00:00Z",
+  "fixtureNote": "These vehicles, routes, occupancy and delay figures are a hand-authored static snapshot, not a live or connected reading from the simulator, a streaming client or Fabric. See website/README.md \"Live Operations fixture (WE-03)\" for the field-to-schema mapping.",
+  "vehicles": [
+    {
+      "vehicleId": "VEH-014",
+      "fleetNumber": "2014",
+      "routeId": "RT-07",
+      "routeNumber": "M70",
+      "status": "IN_SERVICE",
+      "occupancy": 34,
+      "capacity": 60,
+      "delaySeconds": 0,
+      "speedKmh": 41.2
+    },
+    {
+      "vehicleId": "VEH-022",
+      "fleetNumber": "2022",
+      "routeId": "RT-03",
+      "routeNumber": "370",
+      "status": "DELAYED",
+      "occupancy": 52,
+      "capacity": 60,
+      "delaySeconds": 420,
+      "speedKmh": 18.5
+    },
+    {
+      "vehicleId": "VEH-031",
+      "fleetNumber": "2031",
+      "routeId": "RT-07",
+      "routeNumber": "M70",
+      "status": "IN_SERVICE",
+      "occupancy": 12,
+      "capacity": 60,
+      "delaySeconds": -60,
+      "speedKmh": 46.8
+    },
+    {
+      "vehicleId": "VEH-045",
+      "fleetNumber": "2045",
+      "routeId": "RT-01",
+      "routeNumber": "M50",
+      "status": "BREAKDOWN",
+      "occupancy": 8,
+      "capacity": 60,
+      "delaySeconds": 900,
+      "speedKmh": 0
+    },
+    {
+      "vehicleId": "VEH-052",
+      "fleetNumber": "2052",
+      "routeId": "RT-09",
+      "routeNumber": "400",
+      "status": "IN_SERVICE",
+      "occupancy": 28,
+      "capacity": 45,
+      "delaySeconds": 30,
+      "speedKmh": 33.0
+    },
+    {
+      "vehicleId": "VEH-063",
+      "fleetNumber": "2063",
+      "routeId": "RT-03",
+      "routeNumber": "370",
+      "status": "DELAYED",
+      "occupancy": 41,
+      "capacity": 60,
+      "delaySeconds": 240,
+      "speedKmh": 22.1
+    },
+    {
+      "vehicleId": "VEH-077",
+      "fleetNumber": "2077",
+      "routeId": "RT-05",
+      "routeNumber": "333",
+      "status": "IN_SERVICE",
+      "occupancy": 19,
+      "capacity": 45,
+      "delaySeconds": 0,
+      "speedKmh": 38.4
+    },
+    {
+      "vehicleId": "VEH-089",
+      "fleetNumber": "2089",
+      "routeId": "RT-09",
+      "routeNumber": "400",
+      "status": "OUT_OF_SERVICE",
+      "occupancy": 0,
+      "capacity": 45,
+      "delaySeconds": 0,
+      "speedKmh": 0
+    }
+  ]
+}
