@@ -1,5 +1,8 @@
 # Backlog: Phase 0 remainder (Day 1) + local Phase 1 (Day 2)
 
+> **Phase 1b (local Fabric-readiness) stories DE-08..DE-14, LD-01, LD-02 are in
+> [`BACKLOG_PHASE_1B.md`](BACKLOG_PHASE_1B.md).**
+
 Produced by the Product Manager agent, reviewed and approved by the Lead on
 2026-11-24. Scope basis: `PROJECT.md` sections 3, 5-13, 17-19, 24-27, 29-32;
 `CLAUDE.md`; ADR-0004; `docs/6-7_DAY_SPRINT.md` Day 1-2.
