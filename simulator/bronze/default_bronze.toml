@@ -1,0 +1,38 @@
+# Default DE-05 Bronze ingestion configuration (simulator/bronze/config.py).
+# Every operational knob of the local Bronze layer lives here rather than in
+# code, per PROJECT.md section 19. Point `--bronze-config` (or
+# `load_bronze_config(path)`) at a copy to change behaviour.
+
+[bronze]
+# Root of the local Bronze store. Under the gitignored simulator/_out/.
+output_dir = "simulator/_out/bronze"
+# Default DE-04 batch directory read by `python -m simulator.bronze batch`.
+batch_input_dir = "simulator/_out/batch"
+# What to do with a line that cannot be stored as a Bronze record as-is
+# (not UTF-8, not JSON, not a JSON object, duplicate keys, or a key that
+# collides with Bronze metadata):
+#   "preserve" - keep the raw line verbatim in a marked parse-error record
+#                (default; Silver/DE-06 quarantines it)
+#   "fail"     - abort the run before commit; nothing is committed (a
+#                FAILED audit manifest is still written)
+parse_error_policy = "preserve"
+# Batch only: compare each dataset file against the DE-04 manifest.json
+# (sha256 + row_count) and fail the run before commit on any mismatch.
+verify_source_manifest = true
+# Cap on per-record parse-error WARNING log lines per run (all errors are
+# still counted in the run manifest and preserved in Bronze).
+max_logged_parse_errors = 100
+
+[bronze.stream]
+# `source` stamped on every record ingested from a streaming (NDJSON) input.
+source = "simulator.telemetry_stream"
+# Bronze table (directory) the stream lands in.
+table = "telemetry_stream"
+
+[bronze.batch]
+# Run-level source label of a batch run.
+source = "simulator.batch"
+# Record-level `source`; `{dataset}` is the DE-04 dataset name.
+record_source_template = "simulator.batch/{dataset}"
+# Name of the DE-04 control file inside a batch directory.
+source_manifest_file = "manifest.json"

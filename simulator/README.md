@@ -9,9 +9,9 @@ Bronze/Silver/Gold transformation logic that can be tested without Fabric, per
 
 Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
 (Deterministic Simulator Core Engine), DE-03 (Incident Injection Scenarios in
-Simulator) and DE-04 (Synthetic Batch & Historical Datasets) implemented.
-Remaining scope (Bronze/Silver/Gold) is not yet implemented — see
-`docs/BACKLOG.md` (DE-05..DE-07).
+Simulator), DE-04 (Synthetic Batch & Historical Datasets) and DE-05 (Local
+Bronze Layer Ingestion Logic) implemented. Remaining scope (Silver/Gold) is
+not yet implemented — see `docs/BACKLOG.md` (DE-06..DE-07).
 
 ## Dependency choice: Pydantic
 
@@ -747,3 +747,294 @@ weather context), `dim_date`, `dim_time`.
   trip-disruption bridge table is a possible later enhancement.
 - Weather is independent per observation (no persistence/fronts) and not
   causally linked to `SEVERE_WEATHER` disruptions.
+
+## DE-05: Local Bronze Layer Ingestion Logic
+
+**Status: IMPLEMENTED - NOT CONNECTED.** `simulator/bronze/` is local Python
+writing local files. No Fabric Lakehouse, OneLake, Eventstream or any other
+Azure/Fabric resource has been created, read or written; nothing here is
+evidence of Fabric execution. See "Mapping to a future Fabric Bronze
+notebook" below for how it is meant to carry over.
+
+Bronze (PROJECT.md section 8, ADR-0002) keeps the source representation with
+minimum transformation plus ingestion metadata, so any later layer can be
+replayed and any record traced to the exact input line that produced it. It
+deliberately does **not** validate business rules, enforce the schema,
+deduplicate or quarantine - that is Silver (DE-06). A null `vehicle_id`,
+latitude 999, `"not-a-timestamp"`, a missing `occupancy`, an unknown route, a
+duplicate, a late or an out-of-order event all land in Bronze exactly as
+received.
+
+### CLI usage
+
+```
+# streaming-shaped input (DE-02 / DE-03 NDJSON): files, or '-' for stdin
+python -m simulator.bronze stream --input events.ndjson --run-id r1
+python -m simulator.incidents --enable-malformed --enable-duplicate --max-events 500 \
+  | python -m simulator.bronze stream --input - --run-id r2
+
+# batch-shaped input (a DE-04 output directory)
+python -m simulator.batch --output-dir simulator/_out/batch
+python -m simulator.bronze batch --input-dir simulator/_out/batch --run-id b1
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--input PATH` (stream, repeatable) | required | NDJSON file, or `-` for stdin. Ingested in the order given. |
+| `--input-dir PATH` (batch) | config `batch_input_dir` (`simulator/_out/batch`) | DE-04 dataset directory. |
+| `--run-id ID` | generated (`<UTC yyyymmddTHHMMSSZ>-<8 hex>`) | Run identifier, `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`. Pass one for reproducible/idempotent reruns. |
+| `--output-dir PATH` | config `output_dir` (`simulator/_out/bronze`, gitignored) | Bronze store root. |
+| `--source LABEL` (stream) | config `stream.source` | Override the stream `source` label. |
+| `--strict` | off | `parse_error_policy = "fail"` (see below). |
+| `--allow-replay` | off | Permit re-ingesting input a committed run already ingested; flagged in the manifest. |
+| `--no-verify-source-manifest` (batch) | off | Record, but do not fail on, a mismatch with DE-04 `manifest.json`. |
+| `--fixed-ingestion-time ISO` | wall clock | Inject a fixed clock (must carry an offset, e.g. `...Z`) for reproducible output. |
+| `--bronze-config PATH` | `simulator/bronze/default_bronze.toml` | Alternate config. |
+| `--log-file PATH` / `--log-level LEVEL` | stderr / `INFO` | Structured JSON-lines logs (same formatter as DE-02). |
+
+Stdout gets one JSON summary line (`status`, `run_id`, `manifest`,
+`records_written`, `parse_error_records`, `replay_of`; or `status: FAILED`,
+`error_type`, `error`). Exit code 0 = committed or already committed with
+identical input; 1 = refused/failed (nothing committed). The library API is
+`simulator.bronze.ingest_stream(...)` / `ingest_batch(...)` (both accept a
+`clock`), and `BronzeStore(root).read_table(table)` reads committed records.
+
+### Store layout
+
+```
+<output_dir>/
+  <table>/run_id=<run_id>/part-00000.jsonl   one data file per table per run
+  _runs/<run_id>.json                         run manifest: audit record AND commit marker
+  _staging/<run_id>/...                       in-flight run, never read, removed on finish
+```
+
+Stream input lands in one table (`stream.table`, default `telemetry_stream`);
+batch input lands in one table per DE-04 dataset (`historical_trips`,
+`service_disruptions`, ...). **A run is committed iff
+`_runs/<run_id>.json` has `status: "COMMITTED"`.** Data is written to staging,
+each table directory is moved into place with an atomic rename, and the
+manifest is written last (temp file + atomic rename). `BronzeStore.read_table`
+(and Silver) read only partitions listed by committed manifests, so a crash
+at any point leaves nothing visible; the next attempt with the same run_id
+removes the orphaned staging/partition directories first and records them in
+`removed_uncommitted_paths`.
+
+### Bronze record contract
+
+One input line -> exactly one Bronze record (one output line), except
+whitespace-only lines, which carry no payload and are counted
+(`blank_lines_skipped`) rather than stored.
+
+**Stored record** (the line is a UTF-8 JSON object): the output line is the
+input object's *own bytes* (JSON whitespace trimmed at the ends) with the
+metadata spliced in before the closing brace. So every original field is
+preserved byte-for-byte - number formatting (`1.10`, `1e5`, big integers),
+string escapes, nulls, nesting and key order - and parsing the record and
+dropping the metadata keys gives back exactly the input object. Appended
+fields, in order:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ingestion_time` | str, UTC ISO-8601 `...Z`, microseconds | When the run ingested the record. One value per run, taken from the injectable clock at run start (mirrors Spark's `current_timestamp()`, evaluated once per query/micro-batch). This is PROJECT.md section 6's `ingestion_time`; `processing_time` is left to Silver (DE-06). |
+| `source` | str | Logical source: `stream.source` (default `simulator.telemetry_stream`) or `simulator.batch/<dataset>` (`batch.record_source_template`). |
+| `run_id` | str | The run that ingested the record. |
+| `_bronze_source_file` | str | Lineage: input file basename (`<stdin>` for stdin). Never a local absolute path. |
+| `_bronze_line_number` | int | Lineage: 1-based physical line in that file. With the file name it pinpoints the exact input line for troubleshooting/replay, and it preserves **arrival order** - which Silver needs for late/out-of-order reasoning, since `event_time`/`generated_at` deliberately cannot be trusted for that. |
+
+The two lineage fields are namespaced `_bronze_*`; any input key equal to a
+Bronze metadata field or starting with `_bronze_` is a collision (see below),
+so metadata can never overwrite or shadow an original field.
+
+**Parse-error record** (anything that cannot be stored as-is): the same five
+fields plus `_bronze_parse_error` (code), `_bronze_parse_error_detail`
+(parser message), `_bronze_raw_line` (the raw line, verbatim) and
+`_bronze_raw_encoding` (`utf-8`, or `base64` when the bytes are not valid
+UTF-8 - so the original bytes are always recoverable, see
+`simulator.bronze.records.raw_line_bytes`). Codes:
+
+| Code | Cause |
+|---|---|
+| `invalid_json` | Truncated/unparseable text, trailing garbage, or non-standard `NaN`/`Infinity`. |
+| `invalid_utf8` | Line bytes are not UTF-8. |
+| `not_a_json_object` | Valid JSON but an array/string/number/`null`. |
+| `duplicate_json_key` | An object (at any depth) repeats a key - readers would silently keep only one value. |
+| `reserved_field_collision` | The input already has `ingestion_time`/`source`/`run_id`/a `_bronze_*` key. |
+
+### Parse-error policy
+
+`parse_error_policy` (config) / `--strict`:
+
+- **`preserve` (default)** - store the marked parse-error record and carry on.
+  Chosen because PROJECT.md section 12 requires that invalid events never
+  silently disappear *and* that quarantine preserves the raw payload, source,
+  ingestion time and run ID: a preserved record gives Silver exactly that, in
+  the same table, under the same run. Failing a whole stream because one
+  message was truncated would stall every good event behind it, and the
+  standard streaming answer is a dead-letter record, not a halt.
+- **`fail`** - the whole input is still scanned (so the audit is complete),
+  then the run fails loudly with `MalformedInputError` naming the first
+  offending `file:line: code` locations; nothing is committed and a `FAILED`
+  manifest records the counts and the error. Use it for sources that must be
+  all-or-nothing.
+
+Either way nothing is silently dropped. A final line without a trailing
+newline (a typical truncated write) is additionally flagged per file as
+`unterminated_final_line: true` even when it happens to parse.
+
+### Idempotency and replay
+
+| Situation | Behaviour |
+|---|---|
+| Same `run_id`, same input, run committed | No-op: returns `ALREADY_COMMITTED`, writes nothing - output stays byte-identical even under a different clock. |
+| Same `run_id`, different input, run committed | Refused: `RunIdConflictError`. A committed run is never overwritten. |
+| Same `run_id`, previous attempt `FAILED` or crashed | Retried from scratch (orphans removed first). |
+| New `run_id`, an input file whose exact content (sha256) a committed run already ingested into the same table | Refused: `DuplicateInputError` (a `FAILED` manifest records the refusal). Renaming the file does not help - detection is by content. |
+| ...the same, with `--allow-replay` | Committed and flagged: manifest `replay_of` lists the prior run ids. The copies stay distinguishable by `run_id`/`ingestion_time`; Silver's `event_id`/primary-key dedup removes them downstream. |
+| The same content given twice within one run (e.g. a file and its copy) | Refused: `DuplicateInputError`; with `--allow-replay` committed and flagged in `duplicate_input_files`. |
+| New `run_id`, new input | Appended as a new run partition. |
+
+"Same input" means the same ordered list of (table, source, file sha256) -
+the manifest's `input_fingerprint`. Files with no records (e.g. DE-04's empty
+weather file when weather is disabled) never count as replays, because they
+cannot cause double-ingestion. Determinism: with an injected clock, the same
+input + run_id produce byte-identical data files and manifest in any store,
+in-process or across separate processes (`--fixed-ingestion-time`).
+
+### Run manifest and accounting identity
+
+`_runs/<run_id>.json` (sorted keys; every time field comes from the injected clock) records:
+`run_id`, `status` (`COMMITTED`/`FAILED`), `mode`, run-level `source`,
+`ingestion_time`, `started_at`, `ended_at`, `duration_seconds`,
+`parse_error_policy`, `allow_replay`, `replay_of`, `duplicate_input_files`, `input_fingerprint`,
+`input_files` (per file: name, path as given, table, source, sha256, size and
+all counters, `parse_errors_by_code`, `unterminated_final_line`, and for batch
+`source_manifest_check`), `tables` (per table: committed path, sha256 of the
+data file, counters), `totals`, `ignored_files`, `removed_uncommitted_paths`,
+`source_reconciliation` and `error`.
+
+Accounting identity, checked per input file, per table and in total before
+commit (and the line count of each staged data file is re-read and compared):
+
+```
+lines_read      == records_read + blank_lines_skipped
+records_read    == records_written
+records_written == json_object_records + parse_error_records
+```
+
+i.e. every non-blank input line is written exactly once; parse errors are
+*part of* `records_written` (preserve policy). Under the fail policy a run
+with `parse_error_records > 0` is not committed at all. This is the Bronze
+leg of the PROJECT.md section 15 identity: DE-06 Silver will continue it as
+`Bronze records_written = valid loaded + quarantined (incl. parse errors) +
+intentionally excluded`.
+
+### Batch input specifics
+
+- With `manifest.json` present, exactly the datasets it lists are ingested,
+  each into its own table, and each file is checked against the DE-04 manifest
+  (`sha256` and `row_count == records_read`). With `verify_source_manifest =
+  true` (default) any mismatch - e.g. a truncated transfer - fails the run
+  before commit (`SourceManifestError`); with `--no-verify-source-manifest` the
+  mismatch is recorded (`source_reconciliation.status = "MISMATCH"`) and the
+  data is ingested under the parse-error policy. Without a manifest, every
+  `*.jsonl` file is ingested (table = file stem) and the status is
+  `NO_SOURCE_MANIFEST`. Other files in the directory are listed in
+  `ignored_files` and logged, never silently skipped.
+- **FU-02:** no watermark predicate or cross-dataset ordering is applied - each
+  file is ingested in full - so a `historical_trips` row whose `updated_at` is
+  earlier than that of the disruption it references (the committed sample has
+  two) is stored like any other. `event_date` is stored byte-for-byte as
+  provided (the local service date) and never re-derived from a UTC
+  timestamp; the sample has 16 telemetry rows where it differs from the UTC
+  date of `updated_at`, and the tests assert they are unchanged.
+
+### Format choice: JSON lines, no new dependency
+
+Bronze output is JSON lines, like DE-02/DE-03/DE-04 input: it is the only
+format that can hold the input *byte-for-byte* plus metadata (and hold
+schema-invalid rows such as `"latitude": 999` or `"event_time":
+"not-a-timestamp"` without coercion), Spark/Fabric read it natively, and it
+needs only the standard library. Parquet would force a typed schema onto
+deliberately untyped Bronze data and add `pyarrow` (a large native dependency)
+for no local benefit; columnar Delta storage is the Fabric Lakehouse's job.
+
+### Configuration: `simulator/bronze/default_bronze.toml`
+
+Validated by `simulator/bronze/config.py` (pydantic, unknown keys rejected):
+`output_dir`, `batch_input_dir`, `parse_error_policy`,
+`verify_source_manifest`, `max_logged_parse_errors` (caps per-record warning
+log lines; every error is still counted and stored), `[bronze.stream]`
+`source`/`table`, `[bronze.batch]` `source`/`record_source_template`/
+`source_manifest_file`.
+
+### Mapping to a future Fabric Bronze notebook
+
+Not implemented or connected - this is the intended translation once the
+Fabric trial is active (ADR-0004), recorded so the local contract carries
+over unchanged:
+
+| Local (DE-05) | Fabric Lakehouse equivalent |
+|---|---|
+| `<table>/run_id=<id>/part-00000.jsonl` | Append to a Delta table `bronze_<table>` in the Lakehouse `Tables/` area (partitioned by ingestion date rather than run_id). |
+| Byte-preserving splice | Read landed files with `spark.read.text` (or keep the raw `value` column) so the original payload survives; parse with `from_json` for convenience columns. |
+| `preserve` / `fail` policy | Spark JSON `mode=PERMISSIVE` with `columnNameOfCorruptRecord` / `mode=FAILFAST`. |
+| `ingestion_time`, `source`, `run_id` | `F.current_timestamp()`, `F.lit(source)`, `F.lit(run_id)` from a pipeline parameter (e.g. the Data Factory pipeline run id). |
+| `_bronze_source_file`, `_bronze_line_number` | `_metadata.file_name` and a per-file row index. |
+| Staging + atomic rename + manifest commit marker | The Delta transaction log (atomic append). |
+| Same-run_id no-op | Delta idempotent writes (`txnAppId`/`txnVersion` writer options) or a pre-check against the run-audit table. |
+| Duplicate-input guard (file sha256) | A processed-files control table checked before load. |
+| `_runs/<run_id>.json` | A `bronze_run_audit` Delta table (PROJECT.md section 15 batch metrics). |
+| `stream` mode over a bounded file/stdin | Eventstream -> Lakehouse destination, or Structured Streaming with a checkpoint where the micro-batch `batchId` plays the role of `run_id`. |
+
+### DE-05 tests
+
+`pytest simulator -q` includes:
+
+- `test_bronze_records.py` - byte-for-byte preservation (number formats,
+  escapes, nesting, whitespace, empty object); every parse-error code with
+  lossless raw-line recovery (incl. invalid UTF-8 via base64).
+- `test_bronze_stream_ingest.py` - DE-02 clean stream and a DE-03 stream with
+  all six malformed modes plus duplicates, late, out-of-order, congestion and
+  breakdown (a guard test proves the fixture really contains each): full
+  round trip of every record, duplicates kept, arrival order kept; multi-file
+  lineage; stdin; source override.
+- `test_bronze_batch_ingest.py` - committed DE-04 sample: round trip of every
+  dataset, counts equal the DE-04 manifest, `event_date` preserved where it
+  differs from the UTC date, FU-02 rows ingested; tampered file fails loudly;
+  verification-off records `MISMATCH` and preserves the truncated line;
+  no-manifest directory; missing/unsafe/empty inputs.
+- `test_bronze_idempotency.py` - every row of the idempotency table, a
+  simulated crash (orphaned partition + staging), a failure during commit,
+  unsafe run ids.
+- `test_bronze_parse_errors.py` - preserve vs fail policy on a file mixing
+  good, garbage, blank, array, non-UTF-8 and truncated lines; unterminated
+  final line; CRLF.
+- `test_bronze_manifest.py` - the accounting identity against independently
+  computed counts and the bytes on disk (line count, sha256), per file/table/
+  total, stream and batch.
+- `test_bronze_determinism.py` - byte-identical stores with an injected clock
+  (in-process and two CLI processes); wall-clock default; non-UTC clock
+  normalised; naive clock rejected.
+- `test_bronze_cli.py` - a real `python -m simulator.incidents` stream piped
+  into `python -m simulator.bronze stream --input -`; batch rerun/duplicate/
+  replay exit codes; `--strict`; missing input; run-id conflict; config
+  validation.
+
+### Known limitations (DE-05)
+
+- **Not connected to Fabric** (see status above); local filesystem only.
+- **Single writer per store.** No file locking; two concurrent runs against
+  the same `output_dir` are unsupported.
+- **Inputs are read fully into memory** (fine at local scale - DE-04 default
+  output is ~22 MB); not a long-running stream consumer. `stream` mode ingests
+  bounded files/stdin as one micro-batch.
+- **Replay detection is per whole file (sha256).** Overlap at row level across
+  *different* files (e.g. DE-04 regenerated with more `service_days`, where
+  the earlier days reappear inside new files) is not detected in Bronze; it is
+  handled by Silver's key-based dedup (DE-06). No watermark-based incremental
+  selection is applied in Bronze - the watermark/incremental engine
+  (PROJECT.md section 11) is later scope.
+- **Blank lines are counted, not stored** (they carry no payload).
+- Run order in `read_table` is by (`ingestion_time`, `run_id`); manifests
+  record input paths as given on the command line.
+- No retention/compaction of old run partitions.
