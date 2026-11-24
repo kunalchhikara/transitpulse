@@ -5,7 +5,7 @@ Usage:
 
 Writes depots.json, stops.json, routes.json and vehicles.json. Re-running
 with the same config/seed overwrites with byte-identical content (see
-`simulator/tests/test_reference_determinism.py`).
+`simulator/tests/test_reference_cli_determinism.py`).
 """
 
 from __future__ import annotations
