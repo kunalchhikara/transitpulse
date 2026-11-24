@@ -360,3 +360,9 @@ note prevents overclaiming, handover.
   — add a configurable bound. Add a configurable Sydney bounding-box GPS rule
   reusing DE-01's `sydney_bounding_box` (currently (0, 0) passes) before
   geo/map Gold work or Fabric. Source: QA of PR #10 (D5, Q5).
+- **FU-09: Make CLI log files safe to reuse.** Every simulator CLI's
+  `--log-file` opens in append mode while `--output` overwrites, and the
+  incident log lines carry no run id. Rerunning to the same paths gave 314
+  event lines but 28 logged duplicate fires, so any log-based
+  reconciliation silently double-counts. Add a run id/marker to log lines
+  and/or a truncate option, and document it. Source: QA of PR #11 (FU-05).
