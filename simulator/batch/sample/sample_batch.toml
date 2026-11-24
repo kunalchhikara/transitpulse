@@ -1,0 +1,104 @@
+# Small DE-04 batch config used ONLY to produce the committed sample fixture
+# (simulator/batch/sample/output/) and fast CLI tests: 1 service day,
+# 3-hourly headway, few journeys per trip, 6-hourly weather. Same keys and
+# semantics as simulator/batch/default_batch.toml (see comments there).
+
+[batch]
+seed = 20250106
+start_date = 2025-01-06
+service_days = 1
+utc_offset_hours = 10
+
+[schedules]
+service_start_time = 06:00:00
+service_end_time = 22:00:00
+headway_minutes = 180
+min_segment_runtime_seconds = 120
+max_segment_runtime_seconds = 420
+dwell_seconds = 30
+min_layover_minutes = 5
+publish_lead_days = 14
+
+[operations]
+min_start_delay_seconds = -60
+max_start_delay_seconds = 180
+min_segment_drift_seconds = -20
+max_segment_drift_seconds = 40
+min_delay_seconds = -120
+delayed_status_threshold_seconds = 300
+min_arrival_speed_kmh = 0.0
+max_arrival_speed_kmh = 8.0
+trip_record_settlement_minutes = 15
+disruption_record_settlement_minutes = 30
+
+[disruptions]
+per_day = 3
+
+[disruptions.severities.LOW]
+weight = 4
+min_delay_impact_seconds = 60
+max_delay_impact_seconds = 300
+
+[disruptions.severities.MEDIUM]
+weight = 3
+min_delay_impact_seconds = 300
+max_delay_impact_seconds = 900
+
+[disruptions.severities.HIGH]
+weight = 2
+min_delay_impact_seconds = 900
+max_delay_impact_seconds = 1800
+
+[disruptions.severities.CRITICAL]
+weight = 1
+min_delay_impact_seconds = 1800
+max_delay_impact_seconds = 3600
+
+[[disruptions.types]]
+name = "VEHICLE_BREAKDOWN"
+effect = "BREAKDOWN"
+weight = 3
+min_duration_minutes = 45
+max_duration_minutes = 180
+
+[[disruptions.types]]
+name = "ROUTE_CONGESTION"
+effect = "DELAY"
+weight = 4
+min_duration_minutes = 30
+max_duration_minutes = 150
+
+[[disruptions.types]]
+name = "DRIVER_UNAVAILABLE"
+effect = "CANCEL"
+weight = 2
+min_duration_minutes = 30
+max_duration_minutes = 120
+
+[passengers]
+min_journeys_per_trip = 2
+max_journeys_per_trip = 5
+card_population = 500
+settlement_lag_minutes = 60
+
+[passengers.fare_types.ADULT]
+weight = 6
+fare_aud = 3.20
+
+[passengers.fare_types.CONCESSION]
+weight = 2
+fare_aud = 1.60
+
+[weather]
+enabled = true
+observation_interval_minutes = 360
+base_temperature_c = 22.0
+diurnal_amplitude_c = 6.0
+peak_temperature_hour = 15
+temperature_noise_c = 1.5
+rain_probability = 0.15
+max_rainfall_mm = 12.0
+heavy_rain_threshold_mm = 6.0
+max_wind_speed_kmh = 70.0
+storm_wind_threshold_kmh = 50.0
+cloudy_probability = 0.35

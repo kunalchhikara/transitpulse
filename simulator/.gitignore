@@ -1,0 +1,3 @@
+# Local generated output from simulator CLIs (reference, batch, ...).
+# Bulk synthetic data is never committed; see simulator/README.md.
+/_out/

@@ -1,0 +1,125 @@
+{
+  "batch_schema_version": "1.0.0",
+  "batch_seed": 20250106,
+  "config_sha256": "65b6274e6fd890d3f3e21370ac72d8e370bd9bf8474edf6687076b75605a57c2",
+  "datasets": {
+    "historical_telemetry": {
+      "file": "historical_telemetry.jsonl",
+      "max_watermark": "2025-01-06T11:11:59Z",
+      "min_watermark": "2025-01-05T20:00:44Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "event_id"
+      ],
+      "row_count": 42,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "3af8823ff3a82fa40a4604dbfd2e5dc8b4f9b95c157183c959f498217e5857b3",
+      "watermark_column": "updated_at"
+    },
+    "historical_trips": {
+      "file": "historical_trips.jsonl",
+      "max_watermark": "2025-01-06T11:26:59Z",
+      "min_watermark": "2025-01-05T20:25:28Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "trip_id"
+      ],
+      "row_count": 12,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "c8976d196fd66fa9ad38d7fc97e51c60375b5f12e90cbaa7058582bada3f4b28",
+      "watermark_column": "updated_at"
+    },
+    "passenger_journeys": {
+      "file": "passenger_journeys.jsonl",
+      "max_watermark": "2025-01-06T12:11:59Z",
+      "min_watermark": "2025-01-05T21:07:30Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "journey_id"
+      ],
+      "row_count": 30,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "5f4e105a9df728c8781151bdb19a6ae6a784ff7518157d21806c0e790b4f7580",
+      "watermark_column": "updated_at"
+    },
+    "schedule_stop_times": {
+      "file": "schedule_stop_times.jsonl",
+      "max_watermark": "2024-12-22T14:00:00Z",
+      "min_watermark": "2024-12-22T14:00:00Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "trip_id",
+        "stop_sequence"
+      ],
+      "row_count": 48,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "2b164bbc6bb6ca5313a37e1ef073868c59ed6f587b54dfe5a3632814a1d3b69d",
+      "watermark_column": "updated_at"
+    },
+    "schedules": {
+      "file": "schedules.jsonl",
+      "max_watermark": "2024-12-22T14:00:00Z",
+      "min_watermark": "2024-12-22T14:00:00Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "trip_id"
+      ],
+      "row_count": 12,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "3f50489b0f786c06a3a9b600361ca9f489144862785c3f71f1d679c2e524c3a4",
+      "watermark_column": "updated_at"
+    },
+    "service_disruptions": {
+      "file": "service_disruptions.jsonl",
+      "max_watermark": "2025-01-06T14:24:32Z",
+      "min_watermark": "2025-01-06T04:57:09Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "disruption_id"
+      ],
+      "row_count": 3,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "67f62c188b7b96c59c298a96cfb377bbfe316d04cc75e8c95988460461fd507b",
+      "watermark_column": "updated_at"
+    },
+    "weather_observations": {
+      "file": "weather_observations.jsonl",
+      "max_watermark": "2025-01-06T08:00:00Z",
+      "min_watermark": "2025-01-05T14:00:00Z",
+      "partition_column": "event_date",
+      "partition_count": 1,
+      "primary_key": [
+        "observation_id"
+      ],
+      "row_count": 8,
+      "schema_versions": [
+        "1.0.0"
+      ],
+      "sha256": "c728a5c0354ca6092fc66765b3249e25ad9205e5e09d7d089724713403c912d4",
+      "watermark_column": "updated_at"
+    }
+  },
+  "generator": "simulator.batch",
+  "reference_seed": 42,
+  "service_days": 1,
+  "start_date": "2025-01-06",
+  "vehicle_overlap_count": 0
+}
