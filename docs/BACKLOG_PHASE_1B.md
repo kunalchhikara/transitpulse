@@ -280,6 +280,13 @@ idempotency/retry table, audit schema, reconciliation identity, "Mapping to
 Fabric" table.
 **DoD:** baseline + QA independently re-runs partial-failure-then-rerun and
 one crash-injection case, checking Bronze row counts match the source.
+**Runbook note (from QA of PR #14, DE-10):** changing `[fleet_changes]` (or
+regenerating an existing `_out/batch` produced before DE-10) rewrites
+`depot_id` on already-extracted `schedules`/`historical_trips` rows without
+changing their `updated_at`, so an `updated_at` watermark cannot see it.
+Document that the DE-04 generator config must stay fixed across an
+incremental series, or the control state must be reset and the source
+regenerated.
 
 ## DE-12: Batch Silver — validate, standardise, merge by primary key
 **Objective:** consume committed Bronze batch runs (each applied once, in
@@ -322,6 +329,8 @@ catalogue by then.
    four reference entities.
 **DoD:** baseline + QA independently re-runs the equivalence test and a
 conflict-quarantine case.
+**Runbook note:** the DE-11 note on keeping the DE-04 generator config fixed
+across an incremental series applies here too.
 
 ## DE-13: Warehouse core — dimensions, SCD2 `dim_vehicle`, `fact_trip`
 **Objective:** source-controlled T-SQL DDL + load scripts for a Fabric
@@ -366,6 +375,18 @@ FU-01); DE-14 facts; semantic model; running anything on Fabric.
 9. Idempotent and deterministic.
 **DoD:** baseline + QA independently checks the SCD2 invariants on a fresh
 multi-transfer fixture and confirms the README does not overclaim execution.
+**Notes from QA of PR #14 (DE-10) — DE-13 must handle:**
+- (a) The Type 2 depot comes only from `vehicle_depot_assignments`. DE-01
+  `vehicles.home_depot_id` still shows the original depot; do not carry it
+  into `dim_vehicle` as a second "depot" attribute.
+- (b) Assignments are recorded `notice_days` (default 21) before they take
+  effect, so a load can contain future-effective versions. Define and
+  document `is_current` (latest recorded version vs version in effect as of
+  the load date) and test it.
+- (c) The generated change log has no backdated changes, so criterion 3's
+  backdating policy needs its own fixture.
+- (d) The source has no `valid_to`; derive it from the vehicle's next row.
+- (e) INITIAL rows are effective from `start_date` only (no earlier history).
 
 ## DE-14: `fact_service_incident`, `fact_route_performance` — COULD (cut first)
 **Objective:** extend DE-13 with `fact_service_incident` (from Silver batch
