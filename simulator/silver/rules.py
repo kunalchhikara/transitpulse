@@ -17,10 +17,13 @@ Two stages (see README "DE-06: Rule catalogue"):
 2. **Thresholds** - only for a record that passed stage 1 (the business rules
    need a typed event): DE-01's `validate_against_thresholds` is called
    *unchanged* with the DE-01 `ValidationThresholds`, the DE-01 reference
-   route ids and the future-time reference instant; each reason string it
-   returns is mapped to a rule id through `THRESHOLD_REASON_RULES`. An
-   unmapped reason raises `ValidationContractError` (DE-01 drift fails loudly
-   instead of producing an unlabelled rejection).
+   route ids, the DE-01 service area (`sydney_bounding_box`) and the
+   future-time reference instant; each reason string it returns is mapped to
+   a rule id through `THRESHOLD_REASON_RULES`. An unmapped reason raises
+   `ValidationContractError` (DE-01 drift fails loudly instead of producing
+   an unlabelled rejection). The Silver-owned `watermark_guard` rule (DE-08,
+   BACKLOG FU-06; configured in `[silver.watermark_guard]`) is evaluated in
+   the same stage.
 
 Divergences from DE-01 (justified in the README): the schema-version gate is
 evaluated first, on the raw value, because the version decides which contract
@@ -38,13 +41,18 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from simulator.config.models import ValidationThresholds
+from simulator.config.models import BoundingBox, ValidationThresholds
 from simulator.schemas.telemetry import TelemetryEvent, validate_against_thresholds
+from simulator.silver.config import (
+    WatermarkGuardConfig,
+    WatermarkGuardMode,
+    WatermarkGuardReference,
+)
 from simulator.silver.errors import ValidationContractError
 
 # -- categories ----------------------------------------------------------------
@@ -65,13 +73,17 @@ REQUIRED_FIELDS = "required_fields"
 PARSABLE_TIMESTAMPS = "parsable_timestamps"
 SCHEMA_CONFORMANCE = "schema_conformance"
 VALID_COORDINATES = "valid_coordinates"
+SERVICE_AREA = "service_area"
 NON_NEGATIVE_SPEED = "non_negative_speed"
 MAX_SPEED = "max_speed"
 NON_NEGATIVE_OCCUPANCY = "non_negative_occupancy"
 MAX_OCCUPANCY = "max_occupancy"
 HEADING_RANGE = "heading_range"
+DELAY_RANGE = "delay_range"
 KNOWN_ROUTE = "known_route"
+TIMESTAMP_BOUNDS = "timestamp_bounds"
 FUTURE_TIME_TOLERANCE = "future_time_tolerance"
+WATERMARK_GUARD = "watermark_guard"
 
 
 @dataclass(frozen=True)
@@ -125,6 +137,13 @@ RULE_CATALOGUE: tuple[RuleSpec, ...] = (
         "latitude in [-90, 90] and longitude in [-180, 180] (TelemetryEvent field bounds).",
     ),
     RuleSpec(
+        SERVICE_AREA, CATEGORY_RULE, "valid latitude/longitude (service area)",
+        "DE-08/FU-08: position inside DE-01 sydney_bounding_box expanded by "
+        "thresholds.service_area_margin_degrees on every side, edges inclusive (when "
+        "thresholds.require_service_area). Stage 2, so a position outside the global range keeps "
+        "valid_coordinates as its only rule.",
+    ),
+    RuleSpec(
         NON_NEGATIVE_SPEED, CATEGORY_RULE, "nonnegative speed",
         "speed_kmh >= 0 (TelemetryEvent) and >= thresholds.min_speed_kmh.",
     ),
@@ -146,13 +165,30 @@ RULE_CATALOGUE: tuple[RuleSpec, ...] = (
         "(DE-01 threshold beyond the section 12 list).",
     ),
     RuleSpec(
+        DELAY_RANGE, CATEGORY_RULE, None,
+        "DE-08/FU-08: thresholds.min_delay_seconds <= delay_seconds <= thresholds.max_delay_seconds "
+        "(inclusive; keeps absurd values such as 10**30 out of clean and inside int64).",
+    ),
+    RuleSpec(
         KNOWN_ROUTE, CATEGORY_RULE, "known route where applicable",
         "route_id is a DE-01 reference route (when thresholds.require_known_route).",
+    ),
+    RuleSpec(
+        TIMESTAMP_BOUNDS, CATEGORY_RULE, "parsable timestamps (absolute bounds)",
+        "DE-08/FU-10: thresholds.min_timestamp <= event_time <= thresholds.max_timestamp, and the same "
+        "for generated_at (inclusive). An event-time rule: Gold never attributes such a record to a period.",
     ),
     RuleSpec(
         FUTURE_TIME_TOLERANCE, CATEGORY_RULE, "future-time tolerance",
         "event_time <= reference + thresholds.future_time_tolerance_seconds, where reference is the event's "
         "generated_at (default) or the Bronze ingestion_time (silver.future_time_reference).",
+    ),
+    RuleSpec(
+        WATERMARK_GUARD, CATEGORY_RULE, "future-time tolerance (watermark guard)",
+        "DE-08/FU-06: event_time <= arrival + silver.watermark_guard.max_skew_seconds, where arrival is the "
+        "Bronze ingestion_time (default) or the Silver processing_time (watermark_guard.reference). A rule "
+        "only with watermark_guard.mode = 'quarantine'; in 'flag' mode such an event is loaded with "
+        "_silver_watermark_guarded = true and does not advance the watermark.",
     ),
 )
 
@@ -172,7 +208,16 @@ THRESHOLD_REASON_RULES: tuple[tuple[str, str], ...] = (
     ("heading exceeds configured maximum", HEADING_RANGE),
     ("unknown route_id", KNOWN_ROUTE),
     ("event_time is beyond the future-time tolerance", FUTURE_TIME_TOLERANCE),
+    ("position outside the configured service area", SERVICE_AREA),
+    ("delay_seconds below configured minimum", DELAY_RANGE),
+    ("delay_seconds exceeds configured maximum", DELAY_RANGE),
+    ("event_time outside configured timestamp bounds", TIMESTAMP_BOUNDS),
+    ("generated_at outside configured timestamp bounds", TIMESTAMP_BOUNDS),
 )
+
+#: Rules whose failure means the record's event_time cannot be trusted to
+#: place it in time: Gold never attributes such a record to a period.
+EVENT_TIME_RULES: tuple[str, ...] = (TIMESTAMP_BOUNDS, FUTURE_TIME_TOLERANCE, WATERMARK_GUARD)
 
 TIMESTAMP_FIELDS: tuple[str, ...] = ("generated_at", "event_time")
 _RANGE_ERROR_TYPES = frozenset({"greater_than_equal", "less_than_equal", "greater_than", "less_than"})
@@ -205,10 +250,13 @@ class Violation:
 
 @dataclass(frozen=True)
 class ValidationOutcome:
-    """`event` is set iff the record is valid (`violations` empty)."""
+    """`event` is set iff the record is valid (`violations` empty).
+    `watermark_guarded`: valid, but tripped the FU-06 watermark guard in
+    `flag` mode (loaded flagged; must not advance the watermark)."""
 
     event: TelemetryEvent | None
     violations: tuple[Violation, ...]
+    watermark_guarded: bool = False
 
     @property
     def is_valid(self) -> bool:
@@ -297,7 +345,60 @@ def _threshold_detail(rule: str, event: TelemetryEvent, thresholds: ValidationTh
             f"event_time={event.event_time.isoformat()} > reference {reference.isoformat()} "
             f"+ {thresholds.future_time_tolerance_seconds}s"
         )
+    if rule == DELAY_RANGE:
+        return (
+            f"delay_seconds={event.delay_seconds}, allowed "
+            f"[{thresholds.min_delay_seconds}, {thresholds.max_delay_seconds}]"
+        )
+    if rule == SERVICE_AREA:
+        return (
+            f"latitude={event.latitude}, longitude={event.longitude}; service area = DE-01 sydney_bounding_box "
+            f"+ {thresholds.service_area_margin_degrees} deg"
+        )
+    if rule == TIMESTAMP_BOUNDS:
+        return (
+            f"event_time={event.event_time.isoformat()}, generated_at={event.generated_at.isoformat()}, allowed "
+            f"[{thresholds.min_timestamp.isoformat()}, {thresholds.max_timestamp.isoformat()}]"
+        )
     return ""
+
+
+@dataclass(frozen=True)
+class WatermarkGuard:
+    """DE-08 / BACKLOG FU-06: an event cannot have been observed long after
+    it arrived. `reason` is None when `event_time <= arrival +
+    max_skew_seconds`, where arrival is the Bronze `ingestion_time` or the
+    Silver `processing_time` (`reference`). Stateless per record, so Gold can
+    re-apply it to quarantined records (the same idea as a broker rejecting
+    messages whose timestamp is too far ahead of its own clock)."""
+
+    mode: WatermarkGuardMode
+    reference: WatermarkGuardReference
+    max_skew_seconds: int
+
+    @classmethod
+    def from_config(cls, config: WatermarkGuardConfig) -> WatermarkGuard:
+        return cls(config.mode, config.reference, config.max_skew_seconds)
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode is not WatermarkGuardMode.OFF
+
+    def arrival(self, *, ingestion_time: datetime | None, processing_time: datetime | None) -> datetime | None:
+        """The configured reference instant (None if not available)."""
+        return ingestion_time if self.reference is WatermarkGuardReference.INGESTION_TIME else processing_time
+
+    def reason(self, event_time: datetime, arrival: datetime) -> str | None:
+        try:
+            limit = arrival + timedelta(seconds=self.max_skew_seconds)
+        except OverflowError:  # arrival at the end of time: nothing can exceed it
+            return None
+        if event_time <= limit:
+            return None
+        return (
+            f"event_time {event_time.isoformat()} is more than {self.max_skew_seconds}s after its "
+            f"{self.reference.value} {arrival.isoformat()} (watermark guard, mode {self.mode.value})"
+        )
 
 
 class TelemetryValidator:
@@ -310,10 +411,17 @@ class TelemetryValidator:
         known_route_ids: Iterable[str],
         *,
         use_ingestion_time_reference: bool = False,
+        service_area: BoundingBox | None = None,
+        watermark_guard: WatermarkGuard | None = None,
     ) -> None:
+        """`service_area` (DE-01 `sydney_bounding_box`) and `watermark_guard`
+        are optional so existing callers keep the pre-DE-08 behaviour;
+        `run_silver` always passes both."""
         self.thresholds = thresholds
         self.known_route_ids = frozenset(known_route_ids)
         self.use_ingestion_time_reference = use_ingestion_time_reference
+        self.service_area = service_area
+        self.watermark_guard = watermark_guard
 
     def validate(
         self,
@@ -321,10 +429,12 @@ class TelemetryValidator:
         original_text: str,
         *,
         ingestion_time: datetime,
+        processing_time: datetime | None = None,
     ) -> ValidationOutcome:
         """`original` is the input object (Bronze metadata stripped) and
         `original_text` its exact source text; `ingestion_time` the Bronze
-        ingestion instant (used only with the ingestion-time reference)."""
+        ingestion instant (future-time and watermark-guard reference) and
+        `processing_time` the Silver run instant (watermark-guard reference)."""
         thresholds = self.thresholds
 
         # Stage 1a: the version gate decides which contract applies.
@@ -381,11 +491,26 @@ class TelemetryValidator:
         # Stage 2: DE-01 thresholds, reused unchanged.
         reference = ingestion_time if self.use_ingestion_time_reference else event.generated_at
         for reason in validate_against_thresholds(
-            event, thresholds, known_route_ids=set(self.known_route_ids), now=reference
+            event, thresholds, known_route_ids=set(self.known_route_ids), now=reference,
+            service_area=self.service_area,
         ):
             rule = threshold_reason_rule(reason)
             detail = _threshold_detail(rule, event, thresholds, reference)
             found.setdefault(rule, []).append(f"{reason} ({detail})" if detail else reason)
+
+        # Stage 2, Silver-owned: the FU-06 watermark guard.
+        guarded = False
+        guard = self.watermark_guard
+        if guard is not None and guard.enabled:
+            arrival = guard.arrival(ingestion_time=ingestion_time, processing_time=processing_time)
+            if arrival is None:
+                raise ValueError(f"watermark guard reference {guard.reference.value!r} needs that instant")
+            reason = guard.reason(event.event_time, arrival)
+            if reason is not None:
+                if guard.mode is WatermarkGuardMode.QUARANTINE:
+                    found.setdefault(WATERMARK_GUARD, []).append(reason)
+                else:
+                    guarded = True
         if found:
             return ValidationOutcome(None, _ordered(found))
-        return ValidationOutcome(event, ())
+        return ValidationOutcome(event, (), watermark_guarded=guarded)

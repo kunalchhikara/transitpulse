@@ -37,3 +37,22 @@ future_time_reference = "generated_at"
 # Cap on per-record rejection WARNING log lines per run (every rejection is
 # still counted in the manifest and written to the quarantine table).
 max_logged_rejections = 100
+
+# DE-08 / BACKLOG FU-06: watermark guard. One valid-looking event whose
+# event_time AND generated_at are far in the future passes the future-time
+# tolerance (measured against its own generated_at) and used to move the
+# watermark, flagging nearly every later event late. The guard measures
+# event_time against the record's ARRIVAL instead: an event cannot have been
+# observed more than max_skew_seconds after it arrived.
+[silver.watermark_guard]
+#   "quarantine" - reject under rule watermark_guard (default)
+#   "flag"       - load it with _silver_watermark_guarded = true; it is
+#                  classified but never advances the watermark
+#   "off"        - no guard (pre-DE-08 behaviour)
+mode = "quarantine"
+#   "ingestion_time"  - the Bronze ingestion_time of the record (default:
+#                       recorded in Bronze, so replays are deterministic)
+#   "processing_time" - this Silver run's processing_time
+reference = "ingestion_time"
+# Allowed clock skew between a producer and the ingesting system.
+max_skew_seconds = 300

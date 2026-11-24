@@ -6,7 +6,7 @@ the mapping of every DE-01 `validate_against_thresholds` reason."""
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -21,6 +21,7 @@ from simulator.silver.rules import (
 )
 from simulator.tests._silver_helpers import (
     DELETE,
+    PIPELINE_RULE_SETTINGS,
     PROCESSING_TIME,
     THRESHOLDS,
     valid_payload,
@@ -88,12 +89,30 @@ NEGATIVE = [
     ("schema_conformance", {"unexpected_field": 1}),
     ("heading_range", {"heading": 360.0}),
     ("heading_range", {"heading": 359.95}),  # above configured 359.9
+    # DE-08 (FU-08, FU-10, FU-06); boundaries and more cases in test_silver_value_bounds.py
+    # and test_silver_watermark_guard.py
+    ("service_area", {"latitude": 0.0, "longitude": 0.0}),
+    ("delay_range", {"delay_seconds": 10**30}),
+    ("delay_range", {"delay_seconds": -(10**30)}),
+    ("timestamp_bounds", {"event_time": "9999-12-31T23:59:59Z", "generated_at": "9999-12-31T23:59:59Z"}),
+    ("timestamp_bounds", {"event_time": "0001-01-01T00:00:00Z", "generated_at": "0001-01-01T00:00:00Z"}),
+    ("watermark_guard", {"event_time": "2090-01-01T00:00:00Z", "generated_at": "2090-01-01T00:00:00Z"}),
 ]
+
+#: Rules `run_silver` evaluates only because it passes the DE-01 service area
+#: and the Silver watermark guard to the validator; their cases are validated
+#: the same way (the other cases keep the plain validator, so e.g. the global
+#: (90, 180) coordinate boundary is still tested on its own).
+PIPELINE_ONLY_RULES = frozenset({"service_area", "watermark_guard"})
+
+
+def _validate_for(rule, payload):
+    return validate(payload, **PIPELINE_RULE_SETTINGS) if rule in PIPELINE_ONLY_RULES else validate(payload)
 
 
 @pytest.mark.parametrize(("rule", "overrides"), NEGATIVE, ids=[f"{r}-{sorted(o)}" for r, o in NEGATIVE])
 def test_negative_case_is_rejected_by_its_rule(rule, overrides):
-    outcome = validate(valid_payload(**overrides))
+    outcome = _validate_for(rule, valid_payload(**overrides))
     assert not outcome.is_valid
     assert outcome.event is None
     assert _rules(outcome)[0] == rule, outcome.violations
@@ -117,12 +136,18 @@ POSITIVE = [
     ("future_time_tolerance", {"event_time": _shift(-3600)}),  # late is not a validation failure
     ("heading_range", {"heading": 359.9}),
     ("heading_range", {"heading": 0.0}),
+    ("service_area", {"latitude": -33.8688, "longitude": 151.2093}),  # Sydney CBD
+    ("delay_range", {"delay_seconds": THRESHOLDS.max_delay_seconds}),
+    ("delay_range", {"delay_seconds": THRESHOLDS.min_delay_seconds}),
+    ("timestamp_bounds", {"event_time": "2000-01-01T00:00:00Z", "generated_at": "2000-01-01T00:00:00Z"}),
+    # validate() ingests at PROCESSING_TIME (2025-02-01T10:00Z); guard skew 300 s.
+    ("watermark_guard", {"event_time": "2025-02-01T10:05:00Z", "generated_at": "2025-02-01T10:05:00Z"}),
 ]
 
 
 @pytest.mark.parametrize(("rule", "overrides"), POSITIVE, ids=[f"{r}-{sorted(o)}" for r, o in POSITIVE])
 def test_positive_case_is_accepted(rule, overrides):
-    outcome = validate(valid_payload(**overrides))
+    outcome = _validate_for(rule, valid_payload(**overrides))
     assert outcome.is_valid, (rule, outcome.violations)
 
 
@@ -262,6 +287,17 @@ def test_every_de01_threshold_reason_maps_to_a_rule():
     reasons += validate_against_thresholds(
         event.model_copy(update={"occupancy": 1}),
         THRESHOLDS.model_copy(update={"min_occupancy": 2}), known_route_ids=None, now=event.generated_at,
+    )
+    # DE-08 reasons: service area, delay bounds, timestamp bounds.
+    far = datetime(9999, 12, 31, tzinfo=UTC)
+    reasons += validate_against_thresholds(
+        event.model_copy(update={"latitude": 0.0, "longitude": 0.0, "delay_seconds": 10**30,
+                                 "event_time": far, "generated_at": far}),
+        THRESHOLDS, known_route_ids=None, now=far, service_area=PIPELINE_RULE_SETTINGS["service_area"],
+    )
+    reasons += validate_against_thresholds(
+        event.model_copy(update={"delay_seconds": -(10**30)}), THRESHOLDS, known_route_ids=None,
+        now=event.generated_at,
     )
     # Every DE-01 reason maps, and every mapping prefix is exercised by a real DE-01 reason.
     mapped = {threshold_reason_rule(r) for r in reasons}

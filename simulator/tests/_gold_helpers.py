@@ -139,6 +139,10 @@ EXPECTED_TOTALS = {
     "unattributed_by_reason": {
         "bronze_parse_error": 1, "raw_payload_unavailable": 1, "route_id_missing_or_unknown": 1,
         "event_time_unparseable": 1, "event_time_rejected": 1,
+        # DE-08 reasons: none of the fixture records triggers them (Q1, Q2 and
+        # Q6 have a supported schema and in-bounds times consistent with their
+        # generated_at and the 09:30 Bronze ingestion time).
+        "schema_version_unsupported": 0, "event_time_rejected_on_recheck": 0, "event_time_unverifiable": 0,
     },
     "overall_valid_percentage": 50.0,
 }

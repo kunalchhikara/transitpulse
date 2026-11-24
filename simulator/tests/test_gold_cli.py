@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from simulator.gold.cli import main
@@ -40,12 +41,28 @@ def test_missing_silver_input_exits_1(tmp_path, capsys):
 
 
 def test_clean_event_in_an_unrepresentable_period_fails_with_the_json_contract(tmp_path, capsys):
-    """QA of PR #12 (D1): Silver loads an event dated 9999-12-31T20:00Z as
+    """QA of PR #12 (D1): Silver loaded an event dated 9999-12-31T20:00Z as
     clean, but its +10 local bucket overflows datetime. Gold must fail
-    through its documented FAILED summary line, not an uncaught traceback."""
-    far = "9999-12-31T20:00:00Z"
+    through its documented FAILED summary line, not an uncaught traceback.
+
+    Since DE-08 (FU-10) Silver quarantines such an event (`timestamp_bounds`),
+    so the clean record is planted by editing the committed clean file and
+    re-signing its sha256 in the Silver manifest: Gold's own contract check
+    must still fail the run cleanly."""
+    far = "9999-12-31T20:00:00.000000Z"
     ok = _event("OK1", "ROUTE-01", "2025-01-01T00:10:00Z", 30)
-    silver_from_lines(tmp_path, [json.dumps(ok), json.dumps(_event("FAR1", "ROUTE-01", far, 30))])
+    result = silver_from_lines(
+        tmp_path, [json.dumps(ok), json.dumps(_event("FAR1", "ROUTE-01", "2025-01-01T00:20:00Z", 30))]
+    )
+    clean = tmp_path / "silver" / result.manifest["tables"]["clean"]["path"]
+    planted = clean.read_bytes().replace(b'"event_time":"2025-01-01T00:20:00.000000Z"',
+                                         f'"event_time":"{far}"'.encode())
+    assert far.encode() in planted
+    clean.write_bytes(planted)
+    manifest_path = tmp_path / "silver" / "_runs" / "s1.json"
+    silver_manifest = json.loads(manifest_path.read_text())
+    silver_manifest["tables"]["clean"]["sha256"] = hashlib.sha256(planted).hexdigest()
+    manifest_path.write_text(json.dumps(silver_manifest))
     code, summary = _main(capsys, tmp_path, "--run-id", "g1")
     assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
     assert "FAR1" in summary["error"]

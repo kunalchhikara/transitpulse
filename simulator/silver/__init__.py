@@ -14,6 +14,9 @@ resource is read or written. See `simulator/README.md` "DE-06".
 from simulator.silver.config import (
     FutureTimeReference,
     SilverConfig,
+    WatermarkGuardConfig,
+    WatermarkGuardMode,
+    WatermarkGuardReference,
     load_silver_config,
 )
 from simulator.silver.errors import (
@@ -32,7 +35,12 @@ from simulator.silver.pipeline import (
     SilverRunResult,
     run_silver,
 )
-from simulator.silver.rules import RULE_CATALOGUE, RULE_IDS, TelemetryValidator
+from simulator.silver.rules import (
+    RULE_CATALOGUE,
+    RULE_IDS,
+    TelemetryValidator,
+    WatermarkGuard,
+)
 
 __all__ = [
     "IN_ORDER",
@@ -51,6 +59,10 @@ __all__ = [
     "SilverRunResult",
     "TelemetryValidator",
     "ValidationContractError",
+    "WatermarkGuard",
+    "WatermarkGuardConfig",
+    "WatermarkGuardMode",
+    "WatermarkGuardReference",
     "load_silver_config",
     "run_silver",
 ]

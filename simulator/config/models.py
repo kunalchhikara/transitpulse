@@ -7,7 +7,16 @@ documented access to configuration instead of raw dicts.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+from datetime import UTC, datetime
+
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
+
+#: Absolute timestamp bounds must leave every in-bounds instant representable
+#: in UTC and at any local offset with a day of headroom (Silver standardises
+#: to UTC; Gold labels periods of up to a day in local time). datetime.min/max
+#: themselves are not: e.g. 0001-01-01T00:00+14:00 has no UTC equivalent.
+REPRESENTABLE_MIN_TIMESTAMP = datetime(1, 1, 3, tzinfo=UTC)
+REPRESENTABLE_MAX_TIMESTAMP = datetime(9999, 12, 29, tzinfo=UTC)
 
 
 class BoundingBox(BaseModel):
@@ -137,6 +146,18 @@ class ValidationThresholds(BaseModel):
     require_known_route: bool
     supported_schema_versions: list[str]
     required_fields: list[str]
+    # DE-08 / BACKLOG FU-08: inclusive delay_seconds bounds.
+    min_delay_seconds: int
+    max_delay_seconds: int
+    # DE-08 / BACKLOG FU-08: service area = ScaleConfig.sydney_bounding_box
+    # expanded by this margin on every side (the box itself stays in
+    # default_scale.toml - one source of truth for "Sydney").
+    require_service_area: bool
+    service_area_margin_degrees: float = Field(ge=0)
+    # DE-08 / BACKLOG FU-10: inclusive absolute bounds on event_time and
+    # generated_at (timezone-aware).
+    min_timestamp: AwareDatetime
+    max_timestamp: AwareDatetime
 
     @model_validator(mode="after")
     def _check_ranges(self) -> ValidationThresholds:
@@ -148,4 +169,13 @@ class ValidationThresholds(BaseModel):
             raise ValueError("min_heading_degrees must be <= max_heading_degrees")
         if not self.supported_schema_versions:
             raise ValueError("supported_schema_versions must not be empty")
+        if self.min_delay_seconds > self.max_delay_seconds:
+            raise ValueError("min_delay_seconds must be <= max_delay_seconds")
+        if self.min_timestamp >= self.max_timestamp:
+            raise ValueError("min_timestamp must be strictly before max_timestamp")
+        if self.min_timestamp < REPRESENTABLE_MIN_TIMESTAMP or self.max_timestamp > REPRESENTABLE_MAX_TIMESTAMP:
+            raise ValueError(
+                f"timestamp bounds must lie within [{REPRESENTABLE_MIN_TIMESTAMP.isoformat()}, "
+                f"{REPRESENTABLE_MAX_TIMESTAMP.isoformat()}] so every in-bounds instant is representable"
+            )
         return self

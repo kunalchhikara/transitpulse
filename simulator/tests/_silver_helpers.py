@@ -34,7 +34,7 @@ from simulator.incidents.injector import IncidentInjector
 from simulator.incidents.logging_setup import configure_incident_logging
 from simulator.reference.generator import generate_reference_dataset
 from simulator.silver import load_silver_config, run_silver
-from simulator.silver.rules import TelemetryValidator
+from simulator.silver.rules import TelemetryValidator, WatermarkGuard
 from simulator.tests._bronze_helpers import (
     FIXED_CLOCK,
     REPO_ROOT,
@@ -49,6 +49,12 @@ PROCESSING_CLOCK = fixed_clock(PROCESSING_TIME)
 SILVER_CONFIG = load_silver_config()
 THRESHOLDS = load_validation_thresholds()
 DELETE = object()
+#: The DE-08 service area and watermark guard exactly as `run_silver` passes
+#: them to `TelemetryValidator` with the default configuration.
+PIPELINE_RULE_SETTINGS = {
+    "service_area": load_scale_config().sydney_bounding_box,
+    "watermark_guard": WatermarkGuard.from_config(SILVER_CONFIG.watermark_guard),
+}
 
 #: Expected primary Silver rule for each DE-03 malformed mode.
 MODE_RULES = {
@@ -80,14 +86,21 @@ def valid_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def validator(**threshold_overrides: Any) -> TelemetryValidator:
+def validator(*, service_area=None, watermark_guard=None, **threshold_overrides: Any) -> TelemetryValidator:
+    """Without `service_area` / `watermark_guard` (the default) the DE-08
+    `service_area` and `watermark_guard` rules are not evaluated - pass
+    `**PIPELINE_RULE_SETTINGS` to validate exactly as `run_silver` does."""
     thresholds = THRESHOLDS.model_copy(update=threshold_overrides) if threshold_overrides else THRESHOLDS
     reference = generate_reference_dataset(load_scale_config())
-    return TelemetryValidator(thresholds, [r.route_id for r in reference.routes])
+    return TelemetryValidator(thresholds, [r.route_id for r in reference.routes], service_area=service_area,
+                              watermark_guard=watermark_guard)
 
 
-def validate(payload: dict[str, Any], *, ingestion_time: datetime = PROCESSING_TIME, **threshold_overrides: Any):
-    return validator(**threshold_overrides).validate(payload, json.dumps(payload), ingestion_time=ingestion_time)
+def validate(payload: dict[str, Any], *, ingestion_time: datetime = PROCESSING_TIME, service_area=None,
+             watermark_guard=None, **threshold_overrides: Any):
+    return validator(service_area=service_area, watermark_guard=watermark_guard, **threshold_overrides).validate(
+        payload, json.dumps(payload), ingestion_time=ingestion_time
+    )
 
 
 # -- Bronze -> Silver ----------------------------------------------------------
@@ -193,6 +206,8 @@ class Expectations:
     late_ids: set = field(default_factory=set)
     valid_ids: set = field(default_factory=set)
     tick_of: dict = field(default_factory=dict)
+    #: event_id -> expected `_silver_event_time_status` of its clean record.
+    status_of: dict = field(default_factory=dict)
 
 
 def derive_expectations(
@@ -229,11 +244,14 @@ def derive_expectations(
         event_time = base_time[tick] - timedelta(seconds=skew.get(tick, 0))
         if max_seen is None or event_time >= max_seen:
             exp.in_order += 1
+            exp.status_of[event_id] = "in_order"
         elif event_time < max_seen - lateness:
             exp.late += 1
             exp.late_ids.add(event_id)
+            exp.status_of[event_id] = "late"
         else:
             exp.out_of_order += 1
+            exp.status_of[event_id] = "out_of_order"
         max_seen = event_time if max_seen is None or event_time > max_seen else max_seen
     exp.valid_ids = loaded
     return exp
@@ -245,7 +263,7 @@ def delivered_event_ids(lines: list[str]) -> list[str]:
 
 
 __all__ = [
-    "DELETE", "MODE_RULES", "PROCESSING_CLOCK", "PROCESSING_TIME", "PROCESSING_TIME_STR", "REPO_ROOT",
+    "DELETE", "MODE_RULES", "PIPELINE_RULE_SETTINGS", "PROCESSING_CLOCK", "PROCESSING_TIME", "PROCESSING_TIME_STR", "REPO_ROOT",
     "SILVER_CONFIG", "THRESHOLDS", "Expectations", "IncidentRun", "bronze_from_bytes", "bronze_from_lines",
     "clean_payloads", "delivered_event_ids", "derive_expectations", "fired", "lines_to_silver",
     "parse_incident_log", "run_incident_stream", "silver", "table", "valid_payload", "validate", "validator",

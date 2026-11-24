@@ -72,6 +72,7 @@ from simulator.silver.rules import (
     RULE_IDS,
     TelemetryValidator,
     Violation,
+    WatermarkGuard,
     parse_error_violation,
 )
 
@@ -181,7 +182,10 @@ class EventTimeTracker:
     * watermark <= event_time < max seen   -> out_of_order (within lateness)
     * event_time < watermark               -> late
     Only events that pass validation and dedup advance the maximum (a
-    corrupt future timestamp must not make everything after it "late")."""
+    corrupt future timestamp must not make everything after it "late"), and
+    the DE-08 watermark guard (FU-06) keeps a valid-looking far-future event
+    from advancing it too: quarantined by default, or observed with
+    `advance=False` in `flag` mode."""
 
     def __init__(self, allowed_lateness_seconds: int) -> None:
         self.allowed_lateness = timedelta(seconds=allowed_lateness_seconds)
@@ -192,16 +196,18 @@ class EventTimeTracker:
     def watermark(self) -> datetime | None:
         return None if self.max_event_time is None else self.max_event_time - self.allowed_lateness
 
-    def observe(self, event_time: datetime) -> tuple[str, float, datetime | None]:
-        """Classify `event_time`, then advance. Returns (status,
-        lateness_seconds behind the max seen so far, watermark at arrival)."""
+    def observe(self, event_time: datetime, *, advance: bool = True) -> tuple[str, float, datetime | None]:
+        """Classify `event_time`, then advance (unless `advance` is False: a
+        guarded event is classified against the current state but never moves
+        the maximum). Returns (status, lateness_seconds behind the max seen so
+        far, watermark at arrival)."""
         watermark = self.watermark
         if self.max_event_time is None or event_time >= self.max_event_time:
             status, lateness = IN_ORDER, 0.0
         else:
             lateness = (self.max_event_time - event_time).total_seconds()
             status = LATE if event_time < watermark else OUT_OF_ORDER
-        if self.max_event_time is None or event_time > self.max_event_time:
+        if advance and (self.max_event_time is None or event_time > self.max_event_time):
             self.max_event_time = event_time
         if self.min_event_time is None or event_time < self.min_event_time:
             self.min_event_time = event_time
@@ -297,14 +303,28 @@ def _reference_fingerprint(reference: ReferenceDataset) -> str:
     return hashlib.sha256(reference.to_json(indent=None).encode("utf-8")).hexdigest()
 
 
+def _service_area(scale_config: ScaleConfig, thresholds: ValidationThresholds) -> dict[str, Any]:
+    """What the DE-08 `service_area` rule checks against (manifest record)."""
+    return {
+        "bounding_box": scale_config.sydney_bounding_box.model_dump(mode="json"),
+        "margin_degrees": thresholds.service_area_margin_degrees,
+        "enabled": thresholds.require_service_area,
+    }
+
+
 def _fingerprint(
-    config: SilverConfig, thresholds: ValidationThresholds, reference_sha: str, runs: Sequence[BronzeRun]
+    config: SilverConfig,
+    thresholds: ValidationThresholds,
+    reference_sha: str,
+    runs: Sequence[BronzeRun],
+    service_area: dict[str, Any],
 ) -> str:
     return _sha256_json(
         {
             "silver": config.fingerprint_fields(),
             "thresholds": thresholds.model_dump(mode="json"),
             "reference_sha256": reference_sha,
+            "service_area": service_area,
             "bronze_runs": [[run.run_id, run.sha256] for run in runs],
         }
     )
@@ -345,7 +365,8 @@ def run_silver(
     bronze = BronzeStore(Path(bronze_dir) if bronze_dir is not None else config.bronze_dir)
     runs = select_runs(bronze, config.bronze_table, bronze_run_ids)
     selection = "all_committed" if bronze_run_ids is None else "explicit"
-    fingerprint = _fingerprint(config, thresholds, reference_sha, runs)
+    service_area = _service_area(scale_config, thresholds)
+    fingerprint = _fingerprint(config, thresholds, reference_sha, runs, service_area)
 
     store = BronzeStore(Path(output_dir) if output_dir is not None else config.output_dir)
     log_ctx = {"silver_run_id": run_id}
@@ -391,6 +412,7 @@ def run_silver(
         ],
         "config": config.fingerprint_fields(),
         "validation_thresholds": thresholds.model_dump(mode="json"),
+        "service_area": service_area,
         "reference_sha256": reference_sha,
         "rule_catalogue": [rule.as_dict() for rule in RULE_CATALOGUE],
         "tables": {},
@@ -429,11 +451,14 @@ def run_silver(
             summary = _process(
                 rows=iter_rows(bronze, runs),
                 ctx=ctx,
+                processing_time=started,
                 config=config,
                 validator=TelemetryValidator(
                     thresholds,
                     (route.route_id for route in reference.routes),
                     use_ingestion_time_reference=config.future_time_reference is FutureTimeReference.INGESTION_TIME,
+                    service_area=scale_config.sydney_bounding_box,
+                    watermark_guard=WatermarkGuard.from_config(config.watermark_guard),
                 ),
                 reference=reference,
                 write=write,
@@ -501,6 +526,7 @@ def _process(
     *,
     rows,
     ctx: _Context,
+    processing_time: datetime,
     config: SilverConfig,
     validator: TelemetryValidator,
     reference: ReferenceDataset,
@@ -523,9 +549,11 @@ def _process(
     enrichment_misses: Counter[str] = Counter()
     seen: dict[str, dict[str, Any]] = {}
     logged = 0
+    watermark_guarded = 0
 
     for seq, row in enumerate(rows, start=1):
         buckets.extracted += 1
+        guarded = False
         if row.is_parse_error:
             violations: Sequence[Violation] = (
                 parse_error_violation(row.record[PARSE_ERROR], row.record.get(PARSE_ERROR_DETAIL)),
@@ -537,8 +565,9 @@ def _process(
                 strip_metadata(row.record),
                 row.original_text,
                 ingestion_time=_parse_utc(row.record[INGESTION_TIME]),
+                processing_time=processing_time,
             )
-            violations, event = outcome.violations, outcome.event
+            violations, event, guarded = outcome.violations, outcome.event, outcome.watermark_guarded
 
         if violations:
             buckets.quarantined += 1
@@ -591,8 +620,9 @@ def _process(
             "_silver_arrival_seq": seq,
             "payload_sha256": payload_sha,
         }
-        status, lateness, watermark = tracker.observe(event.event_time.astimezone(UTC))
+        status, lateness, watermark = tracker.observe(event.event_time.astimezone(UTC), advance=not guarded)
         event_time_status[status] += 1
+        watermark_guarded += guarded
         route = routes.get(event.route_id)
         vehicle = vehicles.get(event.vehicle_id)
         if route is None:
@@ -614,6 +644,7 @@ def _process(
                 "_silver_event_time_status": status,
                 "_silver_lateness_seconds": lateness,
                 "_silver_watermark": format_timestamp(watermark) if watermark is not None else None,
+                "_silver_watermark_guarded": guarded,
             },
         )
 
@@ -627,6 +658,7 @@ def _process(
         "in_order": event_time_status[IN_ORDER],
         "out_of_order": event_time_status[OUT_OF_ORDER],
         "late": event_time_status[LATE],
+        "watermark_guarded": watermark_guarded,
         "parse_errors": by_category[CATEGORY_PARSE],
         "schema_failures": by_category[CATEGORY_SCHEMA],
         "rule_failures": by_category[CATEGORY_RULE],
@@ -644,6 +676,7 @@ def _process(
     event_time = {
         "allowed_lateness_seconds": config.allowed_lateness_seconds,
         "future_time_reference": config.future_time_reference.value,
+        "watermark_guard": config.watermark_guard.model_dump(mode="json"),
         "min_event_time": format_timestamp(tracker.min_event_time) if tracker.min_event_time else None,
         "max_event_time": format_timestamp(tracker.max_event_time) if tracker.max_event_time else None,
         "final_watermark": format_timestamp(tracker.watermark) if tracker.watermark else None,

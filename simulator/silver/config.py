@@ -31,6 +31,31 @@ class FutureTimeReference(str, Enum):
     INGESTION_TIME = "ingestion_time"
 
 
+class WatermarkGuardMode(str, Enum):
+    """What the DE-08 / FU-06 watermark guard does with an event whose
+    event_time is too far after its arrival time (README "DE-06: Watermark
+    guard")."""
+
+    QUARANTINE = "quarantine"  # reject under rule `watermark_guard`
+    FLAG = "flag"  # load, `_silver_watermark_guarded = true`, never advances the watermark
+    OFF = "off"  # no guard (pre-DE-08 behaviour)
+
+
+class WatermarkGuardReference(str, Enum):
+    """The arrival instant the guard measures event_time against."""
+
+    INGESTION_TIME = "ingestion_time"  # Bronze ingestion_time of the record (recorded, replayable)
+    PROCESSING_TIME = "processing_time"  # this Silver run's processing_time
+
+
+class WatermarkGuardConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    mode: WatermarkGuardMode
+    reference: WatermarkGuardReference
+    max_skew_seconds: int = Field(ge=0)
+
+
 class SilverConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -42,6 +67,7 @@ class SilverConfig(BaseModel):
     duplicates_table: str
     allowed_lateness_seconds: int = Field(ge=0)
     future_time_reference: FutureTimeReference = FutureTimeReference.GENERATED_AT
+    watermark_guard: WatermarkGuardConfig
     max_logged_rejections: int = Field(ge=0, default=100)
 
     @field_validator("bronze_table", "clean_table", "quarantine_table", "duplicates_table")
@@ -69,6 +95,7 @@ class SilverConfig(BaseModel):
             "duplicates_table": self.duplicates_table,
             "allowed_lateness_seconds": self.allowed_lateness_seconds,
             "future_time_reference": self.future_time_reference.value,
+            "watermark_guard": self.watermark_guard.model_dump(mode="json"),
         }
 
 
