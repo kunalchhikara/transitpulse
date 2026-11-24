@@ -395,9 +395,11 @@ by this work.
 section 7 batch sources on top of DE-01's reference entities
 (vehicles/routes/stops/depots, which are *not* regenerated or modified here):
 `schedules`, `schedule_stop_times`, `historical_trips`, `historical_telemetry`,
-`passenger_journeys`, `service_disruptions` and the optional
-`weather_observations`. It only *produces* datasets; incremental-load/watermark
-engine logic is DE-05+ scope.
+`passenger_journeys`, `service_disruptions`, the optional
+`weather_observations` and (DE-10) `vehicle_depot_assignments`, the
+effective-dated vehicle-to-depot change history that feeds an SCD Type 2
+`dim_vehicle`. It only *produces* datasets; incremental-load/watermark engine
+logic is DE-05+ scope.
 
 **Status: IMPLEMENTED - NOT CONNECTED.** Local Python only; no Fabric/Azure
 resource has been created, read or written. Output is local files.
@@ -455,6 +457,7 @@ behavioural number is hardcoded in generator code.
 | `[disruptions]` | `per_day` (exact count), severity weights + delay-impact ranges, disruption types (`effect` = `DELAY` / `BREAKDOWN` / `CANCEL`, weight, duration range). |
 | `[passengers]` | journeys-per-trip range (capped at vehicle capacity), card population, settlement lag, fare types (weight + flat fare). |
 | `[weather]` | `enabled`, observation interval (must divide 1440), temperature/rain/wind/cloud parameters and condition thresholds. |
+| `[fleet_changes]` (DE-10) | `enabled`, `transfers_per_day` (exact count per later service date), `relief_pool_size` (sub-fleet transfers are drawn from; must be >= `transfers_per_day`), `notice_days` (record lead for INITIAL and TRANSFER rows; must be >= `publish_lead_days` whether or not transfers are generated; omitted = `publish_lead_days`). All keys optional: an absent section or `enabled = false` alone = disabled. |
 
 Exact volume formulas (verified by `simulator/tests/test_batch_volume.py`):
 
@@ -466,6 +469,10 @@ Exact volume formulas (verified by `simulator/tests/test_batch_volume.py`):
   [`min_journeys_per_trip`, `max_journeys_per_trip`] capped at vehicle capacity
 - `service_disruptions` = `disruptions.per_day` x `service_days`
 - `weather_observations` = depots x `service_days` x (1440 / interval), or 0 when disabled
+- `vehicle_depot_assignments` = vehicles (one `INITIAL` each) +
+  `transfers_per_day` x (`service_days` - 1) when `[fleet_changes] enabled`,
+  else vehicles. Default: 50 + 1 x 6 = 56 (also tested in
+  `test_batch_vehicle_depot_assignments.py`).
 
 ### Determinism contract
 
@@ -475,16 +482,20 @@ byte-identical files, in-process and across two separate OS-process CLI runs
 independent `random.Random` streams derived from the seed plus a stable key
 (`simulator/batch/rng.py`: per route timetable, per service day for
 disruptions, per trip for operations/journeys/telemetry, per depot-day for
-weather); string seeds are SHA-512-hashed by Python, so they do not depend on
+weather, once per seed for the DE-10 relief pool and per service day for
+transfers); string seeds are SHA-512-hashed by Python, so they do not depend on
 `PYTHONHASHSEED`. Nothing reads wall-clock time. Because streams are keyed per
 day/trip, output is **prefix-stable**: growing `service_days` appends new days
 without changing a byte of existing ones - the behaviour a watermark-based
 incremental extract expects from a source system.
 
-The committed sample in `simulator/batch/sample/output/` (1 day, 2 routes, ~155
-rows, ~70 KB) is generated from `sample/sample_batch.toml` +
-`sample/sample_scale.toml`; a test regenerates it and requires a byte-identical
-match. Regenerate it after an intentional generator change with:
+The committed sample in `simulator/batch/sample/output/` (2 days, 2 routes, 326
+rows, ~140 KB; 2 days since DE-10 so it contains `TRANSFER` rows, including one
+for a vehicle that operates trips and has a trip-scoped disruption on day 2) is
+generated from `sample/sample_batch.toml` + `sample/sample_scale.toml`; a test
+regenerates it and requires a byte-identical match. Its day-1 rows are
+byte-identical to the pre-DE-10 1-day sample (prefix stability). Downstream
+tests must derive expected counts from its `manifest.json`, not hardcode them. Regenerate it after an intentional generator change with:
 
 ```
 python -m simulator.batch --output-dir simulator/batch/sample/output \
@@ -515,6 +526,12 @@ python -m simulator.batch --output-dir simulator/batch/sample/output \
   delay + disruption impact, then per-segment drift, floored at
   `min_delay_seconds` (config validation guarantees strictly increasing stop
   times).
+- **Fleet changes (DE-10).** See `vehicle_depot_assignments` below. A
+  transfer changes only the depot a vehicle's trips are *attributed* to from
+  its effective date (`schedules`, `historical_trips` and trip-scoped
+  `service_disruptions` `depot_id`); it never changes which vehicle operates
+  a trip, and transfers use their own RNG streams, so no other value in any
+  dataset moves.
 - **Passengers.** Journeys board/alight at served stops of the trip
   (boarding before alighting). Telemetry `occupancy` at stop *k* is exactly the
   number of journeys boarded before *k* and alighting at or after *k*, so
@@ -526,14 +543,16 @@ python -m simulator.batch --output-dir simulator/batch/sample/output \
 Every dataset row has `schema_version`, `updated_at` (aware UTC; the
 **watermark column**: when the record became final in the source system) and
 `event_date` (the **partition column**: local operating/service date for
-trip-derived datasets, local observation date for weather). A later
+trip-derived datasets, local observation date for weather, local effective
+service date for `vehicle_depot_assignments`). A later
 incremental load selects `updated_at > last_watermark` and advances the
 watermark only after success (PROJECT.md section 11). `updated_at` semantics:
 timetables are published `publish_lead_days` before service (midnight local);
 trips settle `trip_record_settlement_minutes` after they end; journeys settle
 `settlement_lag_minutes` after alighting; disruptions close
 `disruption_record_settlement_minutes` after resolution; telemetry and
-weather are final when observed (`updated_at` = `event_time` / `observed_at`).
+weather are final when observed (`updated_at` = `event_time` / `observed_at`);
+depot assignments are recorded `notice_days` before they take effect.
 
 `schema_version` is `BATCH_SCHEMA_VERSION` (`"1.0.0"`,
 `simulator/batch/schemas.py`) for every dataset except `historical_telemetry`,
@@ -567,7 +586,7 @@ Timetable header, one row per scheduled trip. **PK** `trip_id`. **Watermark**
 | `direction` | enum | `OUTBOUND` / `INBOUND`. |
 | `trip_sequence` | int | 1-based order of the trip on its route that day. |
 | `vehicle_id` | str | FK -> DE-01 `vehicles.vehicle_id` (planned vehicle). |
-| `depot_id` | str | FK -> DE-01 `depots.depot_id`; the vehicle's home depot. |
+| `depot_id` | str | FK -> DE-01 `depots.depot_id`; the vehicle's effective depot on `event_date` (`vehicle_depot_assignments`; DE-01 home depot until transferred). |
 | `origin_stop_id` | str | FK -> `stops.stop_id`; first stop for this direction. |
 | `destination_stop_id` | str | FK -> `stops.stop_id`; last stop for this direction. |
 | `stop_count` | int | Number of stops (= `schedule_stop_times` rows for the trip). |
@@ -606,7 +625,7 @@ Operated outcome of every scheduled trip (1:1 with `schedules`). **PK**
 | `trip_id` | str | PK; FK -> `schedules.trip_id`. |
 | `route_id` | str | FK -> `routes.route_id` (matches schedule). |
 | `vehicle_id` | str | FK -> `vehicles.vehicle_id` (matches schedule). |
-| `depot_id` | str | FK -> `depots.depot_id` (matches schedule). |
+| `depot_id` | str | FK -> `depots.depot_id` (matches schedule: vehicle's effective depot on `event_date`). |
 | `direction` | enum | Matches schedule. |
 | `trip_status` | enum | `COMPLETED` / `PARTIAL` (breakdown) / `CANCELLED`. |
 | `scheduled_departure` | UTC datetime | Copied from schedule. |
@@ -701,7 +720,7 @@ impact measures) - asserted by
 | `severity` | enum | `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`. |
 | `status` | enum | `RESOLVED` (historical log). |
 | `route_id` | str | FK -> `routes.route_id`. |
-| `depot_id` | str | FK -> `depots.depot_id`; route home depot (ROUTE) or vehicle home depot (TRIP). |
+| `depot_id` | str | FK -> `depots.depot_id`; route home depot (ROUTE) or the vehicle's effective depot on `event_date` (TRIP). |
 | `vehicle_id` | str, nullable | FK -> `vehicles.vehicle_id`; set when TRIP-scoped. |
 | `trip_id` | str, nullable | FK -> `schedules.trip_id`; set when TRIP-scoped. |
 | `stop_id` | str, nullable | FK -> `stops.stop_id`; breakdown location / cancelled trip origin. |
@@ -738,6 +757,61 @@ weather context), `dim_date`, `dim_time`.
 | `event_date` | date | Partition: local observation date. |
 | `updated_at` | UTC datetime | Watermark (= `observed_at`). |
 
+### `vehicle_depot_assignments`
+
+DE-10. Effective-dated vehicle-to-depot assignment change log, the SCD Type 2
+source for `dim_vehicle` (depot as the Type 2 attribute). **PK**
+`assignment_id`. **Watermark** `updated_at` (when the assignment was recorded
+in the source fleet system). **Partition** `event_date` (local effective
+service date). **FKs** `vehicle_id` -> `vehicles`, `depot_id` /
+`previous_depot_id` -> `depots`. **Supports** `dim_vehicle` (SCD2 depot
+history), `dim_depot`.
+
+Transfer model (`simulator/batch/fleet.py`, config `[fleet_changes]`):
+
+- Exactly one `INITIAL` row per DE-01 vehicle: its DE-01 `home_depot_id`,
+  effective on `start_date`, `change_sequence` 1.
+- When enabled, a relief pool of `relief_pool_size` vehicles is drawn once
+  per seed from the fleet. On each later service date (`start_date + 1` ..
+  `start_date + service_days - 1`) exactly `transfers_per_day` distinct pool
+  vehicles move to a depot drawn uniformly from the depots *other than* their
+  current one. So a transfer always changes depot, a vehicle never has two
+  changes on one effective date, and A -> B -> A histories can occur. With
+  more transfers than pool vehicles, some vehicle transfers at least twice
+  (pigeonhole): the default (1/day, pool 3, 7 days) gives 6 transfers with
+  one vehicle moving 3 times and another twice.
+- A row's depot applies from `effective_from` (local midnight of
+  `event_date`, a service-date boundary) until the same vehicle's next row;
+  every trip / schedule / trip-scoped disruption with that vehicle on a
+  service date is attributed to the depot effective on its `event_date`.
+- `updated_at` = `effective_from` - `notice_days` (omitted =
+  `publish_lead_days`). Validation requires `notice_days >= publish_lead_days`
+  for every row, INITIAL included (so even with transfers off), so a
+  published timetable never attributes a depot that was not yet recorded. Per
+  vehicle, `updated_at` increases with the effective date: the generated log
+  has no backdated changes (DE-13 still needs a backdating policy for real
+  sources).
+- Infeasible configs fail loudly (`InfeasibleFleetChangeConfigError`): pool
+  larger than the fleet, or transfers with fewer than 2 depots.
+- Disabled (or `[fleet_changes]` absent): `INITIAL` rows only, and every
+  pre-DE-10 dataset file is byte-identical to pre-DE-10 output for the same
+  seed and configs (pinned SHA-256 test against `main` at 295f7db). Only
+  `manifest.json` differs: it gains this dataset and its `config_sha256`
+  covers the new section.
+
+| Column | Type | Notes |
+|---|---|---|
+| `schema_version` | str | `BATCH_SCHEMA_VERSION`. |
+| `assignment_id` | str | PK. `VDA-<vehicle_id>-<yyyymmdd effective date>`; unique because a vehicle has at most one change per date. |
+| `vehicle_id` | str | FK -> DE-01 `vehicles.vehicle_id`. |
+| `depot_id` | str | FK -> DE-01 `depots.depot_id`; depot from `effective_from`. |
+| `previous_depot_id` | str, nullable | FK -> `depots.depot_id`; null for `INITIAL`, otherwise the vehicle's previous row's depot (never equal to `depot_id`). |
+| `change_type` | enum | `INITIAL` / `TRANSFER`. |
+| `change_sequence` | int | 1 for `INITIAL`, +1 per `TRANSFER` of the vehicle (version number). |
+| `effective_from` | UTC datetime | Local midnight of `event_date` in UTC. |
+| `event_date` | date | Partition: local effective service date. |
+| `updated_at` | UTC datetime | Watermark: `effective_from` - `notice_days`. |
+
 ### DE-04 tests
 
 `pytest simulator -q` runs, among the rest of the suite:
@@ -748,6 +822,7 @@ weather context), `dim_date`, `dim_time`.
 - `test_batch_consistency.py` - aggregates reconcile with detail rows; occupancy derivation; strictly increasing times; no vehicle double-booking; each disruption effect; watermark semantics.
 - `test_batch_schemas.py` - per-dataset schema round trip, required/unknown-field negatives, TelemetryEvent conformance, `fact_service_incident` sufficiency, README catalogue coverage.
 - `test_batch_determinism.py` - in-process and cross-process byte identity, seed sensitivity, prefix stability, committed-sample reproducibility, idempotent rerun, manifest reconciliation.
+- `test_batch_vehicle_depot_assignments.py` (DE-10) - catalogue entry; INITIAL/TRANSFER invariants; volume formula; 100% depot attribution of schedules/trips/trip-scoped disruptions vs an independent point-in-time lookup (default, committed sample, heavy-transfer config, with non-vacuity checks); transfers change only `depot_id`; disabled -> byte-identical to pinned pre-DE-10 digests; config validation and infeasible configs.
 
 ### Known limitations (DE-04)
 
@@ -763,9 +838,13 @@ weather context), `dim_date`, `dim_time`.
 - **Trip-id namespaces differ from DE-02.** DE-02's live generator emits
   `TRIP-<route>-<lap>` trip ids that are not linked to this timetable; joining
   live telemetry to scheduled trips needs a later alignment story.
-- **No SCD history yet.** Vehicles keep DE-01's single home depot / route
-  assignment; vehicle-to-depot change history for `dim_vehicle` SCD2 is a
-  later story.
+- **Depot history only (DE-10).** `vehicle_depot_assignments` provides the
+  vehicle-to-depot change history for `dim_vehicle` SCD2; the SCD2 logic
+  itself is DE-13. A transfer does not change the vehicle's DE-01
+  `assigned_route_id` or trip vehicle selection, so a transferred vehicle
+  keeps serving its route and route-scoped disruptions keep the route's home
+  depot. Transfers do not check depot bay `capacity`, and the DE-01 `vehicles`
+  reference entity still shows the original `home_depot_id`.
 - **Planned vehicle = operated vehicle.** Cancelled trips are not re-covered
   by a spare vehicle.
 - **Delay does not propagate to a vehicle's next trip.** A `DELAY`

@@ -17,10 +17,14 @@ Timetable model:
   `assigned_route_id` is the route; falling back to the route's home-depot
   vehicles, then the whole fleet, if a pool is empty), picking the first
   vehicle free since its previous trip ended plus `min_layover_minutes`.
+- A trip's `depot_id` is its vehicle's *effective* depot on the service date
+  (DE-10 `vehicle_depot_assignments`; the DE-01 home depot when the vehicle
+  has not been transferred). Transfers never change which vehicle is chosen.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 
@@ -132,8 +136,13 @@ def build_day_timetable(
     config: BatchConfig,
     runtimes_by_route: dict[str, list[int]],
     pools: dict[str, list[Vehicle]],
+    depot_by_vehicle: Mapping[str, str] | None = None,
 ) -> tuple[list[PlannedTrip], int]:
     """Plan every trip for `service_date`, sorted by departure.
+
+    `depot_by_vehicle` maps vehicle_id -> effective depot on `service_date`
+    (DE-10); when omitted every trip is attributed to its vehicle's DE-01
+    home depot.
 
     Returns `(trips, overlap_count)` where `overlap_count` is how many trips
     had to be given a vehicle that was not yet free (only possible if a pool
@@ -188,7 +197,11 @@ def build_day_timetable(
                 trip_sequence=dep.trip_sequence,
                 service_date=service_date,
                 vehicle_id=vehicle.vehicle_id,
-                depot_id=vehicle.home_depot_id,
+                depot_id=(
+                    depot_by_vehicle[vehicle.vehicle_id]
+                    if depot_by_vehicle is not None
+                    else vehicle.home_depot_id
+                ),
                 stops=stops,
             )
         )

@@ -205,6 +205,44 @@ class WeatherConfig(_Strict):
         return _MINUTES_PER_DAY // self.observation_interval_minutes
 
 
+class FleetChangesConfig(_Strict):
+    """DE-10 vehicle-to-depot transfers (`vehicle_depot_assignments`).
+
+    `enabled = false` (or an absent `[fleet_changes]` section) means no
+    TRANSFER rows: every vehicle keeps its DE-01 home depot for the whole
+    run, so every pre-DE-10 dataset is byte-identical to pre-DE-10 output.
+    """
+
+    enabled: bool = False
+    #: Exact number of vehicles transferred on each effective date after
+    #: `start_date` (start_date + 1 .. start_date + service_days - 1).
+    transfers_per_day: int = Field(default=0, ge=0)
+    #: Size of the relief sub-fleet (drawn once per seed from the DE-01 fleet)
+    #: that transfers are drawn from. Keeping it small models spare vehicles
+    #: loaned between depots and guarantees multi-transfer histories by
+    #: pigeonhole once total transfers exceed the pool size.
+    relief_pool_size: int = Field(default=0, ge=0)
+    #: An assignment (INITIAL and TRANSFER rows alike) is recorded in the
+    #: source fleet system (its `updated_at`) this many days before local
+    #: midnight of its effective date. Unset = `schedules.publish_lead_days`
+    #: (see `BatchConfig.fleet_notice_days`).
+    notice_days: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> FleetChangesConfig:
+        if self.enabled and self.transfers_per_day > self.relief_pool_size:
+            raise ValueError(
+                "transfers_per_day must be <= relief_pool_size (one change per "
+                "vehicle per effective date)"
+            )
+        return self
+
+
+#: Used when a batch config has no `[fleet_changes]` section: no transfers,
+#: so older configs keep reproducing their pre-DE-10 output.
+FLEET_CHANGES_DISABLED = FleetChangesConfig(enabled=False)
+
+
 class BatchConfig(_Strict):
     """Top-level validated DE-04 configuration."""
 
@@ -214,6 +252,26 @@ class BatchConfig(_Strict):
     disruptions: DisruptionsConfig
     passengers: PassengersConfig
     weather: WeatherConfig
+    fleet_changes: FleetChangesConfig = FLEET_CHANGES_DISABLED
+
+    @property
+    def fleet_notice_days(self) -> int:
+        """Record lead of every depot assignment (INITIAL and TRANSFER)."""
+        notice = self.fleet_changes.notice_days
+        return self.schedules.publish_lead_days if notice is None else notice
+
+    @model_validator(mode="after")
+    def _check_fleet_change_notice(self) -> BatchConfig:
+        # A timetable published `publish_lead_days` ahead attributes trips to
+        # the vehicle's depot on the service date, so that assignment must
+        # already be recorded when the timetable is published. This applies to
+        # INITIAL rows too, so it holds whether or not transfers are generated.
+        if self.fleet_notice_days < self.schedules.publish_lead_days:
+            raise ValueError(
+                "fleet_changes.notice_days must be >= schedules.publish_lead_days so a "
+                "published timetable never attributes a depot not yet recorded"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_monotonic_times(self) -> BatchConfig:

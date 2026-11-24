@@ -190,3 +190,8 @@ def test_watermark_columns_have_source_system_semantics():
     for name in ("schedules", "historical_trips", "historical_telemetry", "passenger_journeys",
                  "service_disruptions", "weather_observations"):
         assert {r.event_date for r in ds.rows(name)} == set(cfg.batch.service_dates), name
+    # DE-10 assignments: recorded `notice_days` before they take effect at
+    # local midnight of their (service-date) partition.
+    for a in ds.vehicle_depot_assignments:
+        assert a.updated_at < a.effective_from
+        assert a.event_date in cfg.batch.service_dates

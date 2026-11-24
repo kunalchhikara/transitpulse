@@ -47,6 +47,8 @@ def test_catalogue_covers_project_section_7_batch_sources():
         "passenger_journeys",
         "service_disruptions",
         "weather_observations",
+        # DE-10: vehicle-to-depot change history (PROJECT.md section 10 SCD2 source).
+        "vehicle_depot_assignments",
     }
 
 

@@ -62,6 +62,27 @@ def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+def effective_depot_lookup(assignment_rows: list[dict]):
+    """Independent point-in-time lookup built only from
+    `vehicle_depot_assignments` dict rows: returns `depot(vehicle_id,
+    event_date_iso)` = depot of the vehicle's latest row whose `event_date`
+    is on or before `event_date_iso` (ISO dates sort lexicographically).
+    Raises KeyError when no row is effective yet."""
+    history: dict[str, list[tuple[str, str]]] = {}
+    for row in assignment_rows:
+        history.setdefault(row["vehicle_id"], []).append((row["event_date"], row["depot_id"]))
+    for changes in history.values():
+        changes.sort()
+
+    def depot(vehicle_id: str, event_date: str) -> str:
+        effective = [d for start, d in history[vehicle_id] if start <= event_date]
+        if not effective:
+            raise KeyError(f"no assignment effective for {vehicle_id} on {event_date}")
+        return effective[-1]
+
+    return depot
+
+
 def run_cli(output_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     result = subprocess.run(
         [sys.executable, "-m", "simulator.batch", "--output-dir", str(output_dir), *extra],
