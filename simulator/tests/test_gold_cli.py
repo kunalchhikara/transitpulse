@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 
 from simulator.gold.cli import main
-from simulator.tests._gold_helpers import EXPECTED_TOTALS, fixture_silver
+from simulator.tests._gold_helpers import (
+    EXPECTED_TOTALS,
+    _event,
+    fixture_silver,
+    silver_from_lines,
+)
 
 
 def _main(capsys, tmp_path, *extra: str) -> tuple[int, dict]:
@@ -32,6 +37,20 @@ def test_commit_then_no_op(tmp_path, capsys):
 def test_missing_silver_input_exits_1(tmp_path, capsys):
     code, summary = _main(capsys, tmp_path, "--run-id", "g1")
     assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
+
+
+def test_clean_event_in_an_unrepresentable_period_fails_with_the_json_contract(tmp_path, capsys):
+    """QA of PR #12 (D1): Silver loads an event dated 9999-12-31T20:00Z as
+    clean, but its +10 local bucket overflows datetime. Gold must fail
+    through its documented FAILED summary line, not an uncaught traceback."""
+    far = "9999-12-31T20:00:00Z"
+    ok = _event("OK1", "ROUTE-01", "2025-01-01T00:10:00Z", 30)
+    silver_from_lines(tmp_path, [json.dumps(ok), json.dumps(_event("FAR1", "ROUTE-01", far, 30))])
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1")
+    assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
+    assert "FAR1" in summary["error"]
+    manifest = json.loads((tmp_path / "gold" / "_runs" / "g1.json").read_text())
+    assert manifest["status"] == "FAILED"
 
 
 def test_unknown_silver_run_id_exits_1(tmp_path, capsys):

@@ -366,3 +366,16 @@ note prevents overclaiming, handover.
   event lines but 28 logged duplicate fires, so any log-based
   reconciliation silently double-counts. Add a run id/marker to log lines
   and/or a truncate option, and document it. Source: QA of PR #11 (FU-05).
+- **FU-10: Sanity bounds on event time.** Silver has no upper or lower bound
+  on `event_time`, so a "valid" event dated 9999-12-31 loads as clean (Gold
+  now refuses it cleanly with a FAILED status rather than crashing) and a
+  quarantined year-0001 record is attributed to a 0001-01-01 Gold row. Add
+  configurable min/max event-time bounds in Silver (fold into FU-08).
+  Source: QA of PR #12 (D1, O2).
+- **FU-11: Tighten Gold quarantine attribution.** Treat
+  `supported_schema_version` failures as unattributable (field meaning is
+  undefined under an unknown schema), and have Gold re-apply the
+  future-time tolerance itself, since Silver only evaluates it for records
+  that pass stage 1. Also document in the README that a COMMITTED Silver
+  manifest with `reconciliation.holds=false` blocks all Gold runs
+  (fail-closed). Source: QA of PR #12 (Q-b, O3).

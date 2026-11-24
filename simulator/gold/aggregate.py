@@ -115,7 +115,12 @@ class Periods:
         Raises OverflowError for an instant whose bucket is not representable."""
         local = instant.astimezone(UTC).replace(tzinfo=None) + self.offset
         index = (local - _NAIVE_EPOCH) // self.length
-        return (_NAIVE_EPOCH + index * self.length - self.offset).replace(tzinfo=UTC)
+        start = (_NAIVE_EPOCH + index * self.length - self.offset).replace(tzinfo=UTC)
+        # The bucket's end and local labels must be representable too (see `labels`).
+        end = start + self.length
+        start.astimezone(self.local_tz)
+        end.astimezone(self.local_tz)
+        return start
 
     def labels(self, start: datetime) -> dict[str, Any]:
         end = start + self.length
@@ -238,7 +243,14 @@ def aggregate_route_performance(
 
     for record in clean:
         route_id, event_time, delay, status = _clean_fields(record)
-        cell = cells.setdefault((route_id, periods.start_of(event_time)), _Cell())
+        try:
+            period_start = periods.start_of(event_time)
+        except OverflowError as exc:
+            raise GoldInputError(
+                f"Silver clean record {record.get('event_id')!r}: event_time {record.get('event_time')!r} "
+                f"falls in a period that cannot be represented ({exc})"
+            ) from exc
+        cell = cells.setdefault((route_id, period_start), _Cell())
         cell.event_count += 1
         cell.sum_delay_seconds += delay
         if status == LATE:

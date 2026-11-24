@@ -190,6 +190,22 @@ def test_period_bucketing(instant, period_minutes, offset, expected_start):
     assert periods.start_of(_utc(instant)) == _utc(expected_start)
 
 
+@pytest.mark.parametrize(
+    ("periods", "instant"),
+    [
+        # Local +10 pushes the bucket start past datetime.max.
+        (HOURLY_AEST, "9999-12-31T20:00:00+00:00"),
+        # Start is representable in UTC (23:00Z) but the bucket END is not.
+        (Periods(period_minutes=60, utc_offset_hours=0), "9999-12-31T23:30:00+00:00"),
+        # A negative offset pushes the bucket before datetime.min.
+        (Periods(period_minutes=60, utc_offset_hours=-10), "0001-01-01T05:00:00+00:00"),
+    ],
+)
+def test_unrepresentable_bucket_raises_overflow(periods, instant):
+    with pytest.raises(OverflowError):
+        periods.start_of(_utc(instant))
+
+
 def test_period_labels_are_utc_and_local():
     labels = HOURLY_AEST.labels(_utc("2025-01-01T23:00:00+00:00"))
     assert labels == {
