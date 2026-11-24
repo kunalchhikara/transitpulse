@@ -1,0 +1,62 @@
+"""DE-07 Gold CLI: exit codes, summary line, alternate config, refusal paths."""
+
+from __future__ import annotations
+
+import json
+
+from simulator.gold.cli import main
+from simulator.tests._gold_helpers import EXPECTED_TOTALS, fixture_silver
+
+
+def _main(capsys, tmp_path, *extra: str) -> tuple[int, dict]:
+    code = main(["--silver-dir", str(tmp_path / "silver"), "--output-dir", str(tmp_path / "gold"),
+                 "--fixed-processing-time", "2025-02-01T11:00:00Z", "--log-file", str(tmp_path / "gold.log"),
+                 *extra])
+    return code, json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+def test_commit_then_no_op(tmp_path, capsys):
+    fixture_silver(tmp_path)
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1")
+    assert code == 0 and summary["status"] == "COMMITTED"
+    assert summary["silver_runs_consumed"] == ["s1"] and summary["silver_selection"] == "latest_committed"
+    assert summary["event_count"] == EXPECTED_TOTALS["valid_loaded"]
+    assert summary["quarantined_unattributed"] == EXPECTED_TOTALS["quarantined_unattributed"]
+    assert summary["reconciliation_holds"] is True
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1")
+    assert code == 0 and summary["status"] == "ALREADY_COMMITTED"
+    logs = [json.loads(line) for line in (tmp_path / "gold.log").read_text().splitlines()]
+    assert any(rec["message"] == "gold run committed" for rec in logs)
+
+
+def test_missing_silver_input_exits_1(tmp_path, capsys):
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1")
+    assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
+
+
+def test_unknown_silver_run_id_exits_1(tmp_path, capsys):
+    fixture_silver(tmp_path)
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1", "--silver-run-id", "nope")
+    assert code == 1 and summary["error_type"] == "GoldInputError"
+
+
+def test_run_id_conflict_exits_1(tmp_path, capsys):
+    fixture_silver(tmp_path)
+    assert _main(capsys, tmp_path, "--run-id", "g1")[0] == 0
+    alt = tmp_path / "alt.toml"
+    alt.write_text(
+        '[gold]\noutput_dir = "x"\nsilver_dir = "y"\nroute_performance_table = "route_performance"\n'
+        "period_minutes = 30\nutc_offset_hours = 10\n"
+    )
+    code, summary = _main(capsys, tmp_path, "--run-id", "g1", "--gold-config", str(alt))
+    assert code == 1 and summary["error_type"] == "GoldRunIdConflictError"
+    code, summary = _main(capsys, tmp_path, "--run-id", "g30", "--gold-config", str(alt))
+    assert code == 0 and summary["status"] == "COMMITTED"
+    manifest = json.loads((tmp_path / "gold" / "_runs" / "g30.json").read_text())
+    assert manifest["config"]["period_minutes"] == 30
+
+
+def test_invalid_run_id_exits_1(tmp_path, capsys):
+    fixture_silver(tmp_path)
+    code, summary = _main(capsys, tmp_path, "--run-id", "../evil")
+    assert code == 1 and summary["status"] == "FAILED"

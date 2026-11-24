@@ -1,0 +1,27 @@
+# Default DE-07 Gold configuration (simulator/gold/config.py).
+# Every operational knob of the local Gold route-performance aggregate lives
+# here rather than in code, per PROJECT.md section 19.
+
+[gold]
+# Root of the local Gold store. Under the gitignored simulator/_out/.
+output_dir = "simulator/_out/gold"
+# Root of the local Silver store Gold reads (DE-06 default output_dir).
+silver_dir = "simulator/_out/silver"
+# Gold output table (directory in the Gold store).
+route_performance_table = "route_performance"
+
+# Aggregation period. Buckets are [start, start + period_minutes) and are
+# aligned to LOCAL midnight (see utc_offset_hours), so period_minutes must
+# divide a day (1440). 60 = hourly route performance.
+period_minutes = 60
+
+# Fixed local-time offset used to align buckets and to label them in local
+# time. 10 = AEST, the same fixed offset (no daylight saving) DE-04 uses for
+# its local service dates (simulator/batch/default_batch.toml). Timestamps
+# are still stored in UTC; with a whole-hour offset and hourly buckets the
+# bucket boundaries are identical in UTC and local time.
+utc_offset_hours = 10
+
+# Also write a CSV copy of the aggregate next to the canonical JSON lines
+# file (same rows, same column order) for spreadsheet/Power BI inspection.
+write_csv = true
