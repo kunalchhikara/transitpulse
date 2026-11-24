@@ -1136,7 +1136,7 @@ does not duplicate them.
 | 1 | `supported_schema_version` | schema | supported schema version | `schema_version` in `supported_schema_versions` (`["1.0.0"]`); a failure short-circuits | - |
 | 2 | `required_fields` | schema | required event_id/vehicle_id | every `required_fields` entry (all 14 section 6 fields) present, not null, not a blank string | `null_vehicle_id`, `missing_field` |
 | 3 | `parsable_timestamps` | schema | parsable timestamps | `generated_at`/`event_time` are ISO-8601 date-time strings **with a UTC offset** | `malformed_timestamp` |
-| 4 | `schema_conformance` | schema | (type enforcement, section 8) | strict `TelemetryEvent`: JSON types not coerced, `status` enum, no unknown fields | - |
+| 4 | `schema_conformance` | schema | (type enforcement, section 8) | strict `TelemetryEvent`: JSON types not coerced, `status` enum, no unknown fields, float fields finite (a number overflowing float64, e.g. `1e400` -> inf, is rejected here regardless of thresholds) | - |
 | 5 | `valid_coordinates` | rule | valid latitude/longitude | latitude in [-90, 90], longitude in [-180, 180] | `invalid_coordinates` |
 | 6 | `non_negative_speed` | rule | nonnegative speed | `speed_kmh >= 0` and `>= min_speed_kmh` (0) | `negative_speed` |
 | 7 | `max_speed` | rule | configurable upper-speed threshold | `speed_kmh <= max_speed_kmh` (120) | - |
@@ -1269,6 +1269,14 @@ payload:
 So the original input bytes are always recoverable (number spellings such as
 `-1.50`/`1e2`, escapes, big integers and invalid UTF-8 included - tested).
 Bronze itself trims JSON whitespace at the line ends (DE-05 contract).
+
+Valid JSON syntax that strict UTF-8 JSON output cannot represent - a number
+overflowing float64 (`1e400` parses to inf) or a lone surrogate escape
+(`"\ud800"`), in any field or key - is still quarantined, never aborts the
+run: `raw_payload` is null, `raw_payload_omitted_reasons` lists why
+(`non_finite_number`, `unpaired_surrogate`; `[]` otherwise), `event_id` is
+null if it holds a lone surrogate, and `raw_payload_text` (ASCII escapes) keeps
+the exact original (PR #10 QA D1/D2, tested).
 
 ### Output layout
 

@@ -34,6 +34,7 @@ local time by 10-11 hours); string-typed numbers/timestamps are not coerced
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -115,7 +116,9 @@ RULE_CATALOGUE: tuple[RuleSpec, ...] = (
     RuleSpec(
         SCHEMA_CONFORMANCE, CATEGORY_SCHEMA, None,
         "Strict TelemetryEvent conformance not covered by a more specific rule: JSON types (no coercion of "
-        "strings/bools to numbers), status enum, no unknown fields.",
+        "strings/bools to numbers), status enum, no unknown fields, float fields finite (a JSON number "
+        "outside the float64 range, e.g. 1e400, parses to +/-inf and is rejected here, whatever the "
+        "configured thresholds).",
     ),
     RuleSpec(
         VALID_COORDINATES, CATEGORY_RULE, "valid latitude/longitude",
@@ -177,6 +180,14 @@ _RANGE_ERROR_TYPES = frozenset({"greater_than_equal", "less_than_equal", "greate
 #: unix-epoch number inside a string ("1735689600"), which is not ISO-8601.
 _ISO_DATETIME_SHAPE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
 _DATETIME = TypeAdapter(datetime)
+#: Float fields of the contract. A JSON number that overflows float64 (valid
+#: JSON syntax, so Bronze stores it) parses to +/-inf; field bounds catch most
+#: of them, but e.g. `speed_kmh` has no upper bound in the model and the
+#: configured `max_speed_kmh` may itself be `inf` (TOML allows it), so
+#: finiteness is checked explicitly - a non-finite value never reaches clean.
+FLOAT_FIELDS: tuple[str, ...] = tuple(
+    name for name, info in TelemetryEvent.model_fields.items() if info.annotation is float
+)
 
 
 @dataclass(frozen=True)
@@ -356,6 +367,13 @@ class TelemetryValidator:
                     continue
                 loc = ".".join(str(part) for part in error.get("loc") or ()) or "<record>"
                 found.setdefault(rule, []).append(f"{loc}: {error.get('msg', error.get('type'))}")
+        if event is not None:
+            for name in FLOAT_FIELDS:
+                value = getattr(event, name)
+                if not math.isfinite(value):
+                    found.setdefault(SCHEMA_CONFORMANCE, []).append(
+                        f"{name}: non-finite number {value} (JSON number outside the float64 range)"
+                    )
         if found:
             return ValidationOutcome(None, _ordered(found))
         assert event is not None  # stage 1 passed

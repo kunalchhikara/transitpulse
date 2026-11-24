@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -114,7 +115,55 @@ def _parse_utc(text: str) -> datetime:
 
 
 def _dumps_line(record: dict[str, Any]) -> str:
+    """Strict: raises on a non-finite float or a lone surrogate. Clean and
+    duplicate records cannot carry either (validation rejects them); the
+    quarantine builder sanitises its parsed fields first (`_quarantine_record`)."""
     return json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+
+
+#: `raw_payload_omitted_reasons` values: why a quarantined object's parsed
+#: form (`raw_payload`) is null although Bronze stored it as an object. Both
+#: are valid JSON *syntax* that strict JSON / UTF-8 output cannot represent;
+#: the exact original text stays in `raw_payload_text` (ASCII escapes), so the
+#: record is still lossless.
+OMITTED_NON_FINITE_NUMBER = "non_finite_number"  # e.g. 1e400 -> inf
+OMITTED_UNPAIRED_SURROGATE = "unpaired_surrogate"  # e.g. "\ud800"
+
+
+def _has_surrogate(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _escape_surrogates(text: str) -> str:
+    """Diagnostic text only (rejection reasons): lone surrogates become their
+    `\\udXXX` spelling so the reason stays writable as UTF-8."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def strict_json_problems(value: Any) -> list[str]:
+    """Sorted `OMITTED_*` codes for the parts of a parsed JSON value that
+    strict JSON (no NaN/inf) in UTF-8 cannot represent (keys included);
+    empty if `_dumps_line` can write it."""
+    problems: set[str] = set()
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                problems.add(OMITTED_NON_FINITE_NUMBER)
+        elif isinstance(item, str):
+            if _has_surrogate(item):
+                problems.add(OMITTED_UNPAIRED_SURROGATE)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return sorted(problems)
 
 
 def _sha256_json(value: Any) -> str:
@@ -181,7 +230,9 @@ def _quarantine_record(
         "primary_rule": primary.rule,
         "rejection_category": primary.category,
         "rejection_rules": [v.rule for v in violations],
-        "rejections": [v.as_dict() for v in violations],
+        "rejections": [
+            {key: _escape_surrogates(text) for key, text in v.as_dict().items()} for v in violations
+        ],
     }
     if row.is_parse_error:
         return {
@@ -189,6 +240,7 @@ def _quarantine_record(
             "event_id": None,
             "raw_format": "bronze_parse_error",
             "raw_payload": None,
+            "raw_payload_omitted_reasons": [],
             "raw_payload_text": record[RAW_LINE],
             "raw_encoding": record[RAW_ENCODING],
             "bronze_parse_error": record[PARSE_ERROR],
@@ -196,11 +248,16 @@ def _quarantine_record(
         }
     original = strip_metadata(record)
     event_id = original.get("event_id")
+    # QA D1/D2 (PR #10): a parsed object holding an overflowed number (inf) or
+    # a lone surrogate cannot be written as strict UTF-8 JSON; keep the exact
+    # text, null the parsed form and say why, instead of aborting the run.
+    omitted = strict_json_problems(original)
     return {
         **common,
-        "event_id": event_id if isinstance(event_id, str) else None,
+        "event_id": event_id if isinstance(event_id, str) and not _has_surrogate(event_id) else None,
         "raw_format": "json_object",
-        "raw_payload": original,
+        "raw_payload": None if omitted else original,
+        "raw_payload_omitted_reasons": omitted,
         "raw_payload_text": row.original_text,
         "raw_encoding": "utf-8",
         "bronze_parse_error": None,
