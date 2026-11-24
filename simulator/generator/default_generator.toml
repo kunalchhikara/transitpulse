@@ -1,0 +1,25 @@
+# Default DE-02 generator configuration: emission rate, movement/dwell
+# dynamics and normal-operation value ranges. Separate from
+# `simulator/config/` (DE-01's scale/validation-threshold contract) --
+# see simulator/generator/config.py docstring. Tune these values (or pass
+# an alternate TOML file via --generator-config) rather than editing code,
+# per PROJECT.md section 19.
+
+[generator]
+seed = 20250101
+events_per_second = 10.0
+simulated_start_time = 2025-01-01T00:00:00Z
+
+cruise_speed_min_kmh = 15.0
+cruise_speed_max_kmh = 60.0
+dwell_speed_jitter_kmh = 3.0
+depart_probability_per_tick = 0.6
+
+min_occupancy_fraction = 0.0
+max_occupancy_fraction = 0.95
+
+min_delay_seconds = -30
+max_delay_seconds = 180
+delayed_status_threshold_seconds = 90
+
+log_level = "INFO"
