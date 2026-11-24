@@ -335,7 +335,9 @@ note prevents overclaiming, handover.
   clean (basename only) and `simulator/_out/` is gitignored, but any
   manifest copied into RECORDED/DEMO evidence or the website must be
   sanitised first. Source: QA of PR #9 (DE-05).
-- **FU-05 (bug): DE-03 duplicate injection drops original events.**
+- **FU-05 (bug, RESOLVED in PR #11): DE-03 duplicate injection drops
+  original events.** Duplicates are now extra deliveries; see the DE-03
+  README section "Duplicate delivery and `--max-events`". Original report:
   `IncidentInjector._apply_duplicate` returns the replayed payload *instead
   of* the current one, so each duplicate fire silently loses one original
   event (Lead-verified: 300 events, 14 fires, 286 distinct ids). Fix so
