@@ -290,3 +290,23 @@ groundwork, pointing to the later full Warehouse/dimensional-model story for
 §10's complete scope.
 **Definition of done:** CI green, tests executed/passing, QA confirms scope
 note prevents overclaiming, handover.
+
+---
+
+## Follow-ups recorded from QA (not yet scheduled)
+
+- **FU-01: Align live and scheduled trip IDs, and propagate delays to a
+  vehicle's next trip.** DE-02's live generator emits `TRIP-<route>-<lap>`
+  trip ids that don't match DE-04's timetable trip ids, and DE-04 doesn't
+  carry a delayed trip's lateness into the same vehicle's next trip (so a
+  vehicle can appear to operate two trips at once on actual times). Neither
+  blocks DE-05..DE-07; both must be resolved before the Warehouse story that
+  joins live telemetry to scheduled trips (`fact_trip`,
+  `fact_route_performance`) or computes vehicle utilisation. Source: QA of
+  PR #8 (DE-04).
+- **FU-02: Ingestion must tolerate out-of-order `updated_at` across
+  datasets.** In DE-04 output, a historical trip's `updated_at` can be
+  earlier than that of the disruption it references, so an incremental load
+  can see the trip before the disruption. DE-05/DE-06 must not reject or
+  drop such rows. Also: `event_date` is the *local* service date and must
+  not be re-derived from UTC timestamps. Source: QA of PR #8 (DE-04).

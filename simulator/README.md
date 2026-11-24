@@ -8,10 +8,10 @@ Bronze/Silver/Gold transformation logic that can be tested without Fabric, per
 `PROJECT.md` sections 5-13, 19.
 
 Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
-(Deterministic Simulator Core Engine) and DE-03 (Incident Injection
-Scenarios in Simulator) implemented. Remaining scope (batch/historical
-datasets, Bronze/Silver/Gold) is not yet implemented — see
-`docs/BACKLOG.md` (DE-04..DE-07).
+(Deterministic Simulator Core Engine), DE-03 (Incident Injection Scenarios in
+Simulator) and DE-04 (Synthetic Batch & Historical Datasets) implemented.
+Remaining scope (Bronze/Silver/Gold) is not yet implemented — see
+`docs/BACKLOG.md` (DE-05..DE-07).
 
 ## Dependency choice: Pydantic
 
@@ -465,7 +465,9 @@ python -m simulator.batch --output-dir simulator/batch/sample/output \
   route's timetable is identical every day. Each trip gets a vehicle from the
   route's pool (DE-01 vehicles whose `assigned_route_id` is the route; fallback
   to home-depot vehicles, then the fleet) that is free after its previous trip
-  plus `min_layover_minutes`; at default scale no vehicle is double-booked.
+  plus `min_layover_minutes`; at default scale no vehicle is double-booked
+  *in the timetable* (scheduled times). Actual operated times can still
+  overlap — see "Known limitations (DE-04)".
 - **Disruptions.** `DELAY` types hit a route for a time window: every trip on
   that route departing inside it gets the severity's delay impact added.
   `BREAKDOWN` types stop a trip after a drawn stop (trip `PARTIAL`, last
@@ -672,7 +674,7 @@ impact measures) - asserted by
 | `end_time` | UTC datetime | Resolution time. |
 | `duration_minutes` | int | `end_time - start_time`. |
 | `estimated_delay_seconds` | int, nullable | DELAY impact added per affected trip; null otherwise. |
-| `affected_trip_count` | int | Trips delayed (ROUTE) or terminated/cancelled (TRIP); reconciles with `historical_trips`. |
+| `affected_trip_count` | int | Trips delayed (ROUTE) or terminated/cancelled (TRIP); reconciles with `historical_trips` by route/time window (not by `disruption_id` FK when disruptions overlap). |
 | `description` | str | Human-readable synthetic summary. |
 | `reported_by` | str | `SYNTHETIC_OPS_CONTROL`. |
 | `event_date` | date | Partition: local service date. |
@@ -731,5 +733,17 @@ weather context), `dim_date`, `dim_time`.
   later story.
 - **Planned vehicle = operated vehicle.** Cancelled trips are not re-covered
   by a spare vehicle.
+- **Delay does not propagate to a vehicle's next trip.** A `DELAY`
+  disruption pushes trip N's actual times later, but the same vehicle's trip
+  N+1 keeps its own (undisrupted) actual times, so in `historical_trips` /
+  `historical_telemetry` a vehicle can appear to operate two trips at once
+  (QA found 4 such overlaps at default config, up to ~30 minutes, all caused
+  by a disruption). No section 12 Silver rule quarantines these rows, but
+  vehicle-utilisation metrics and `fact_vehicle_telemetry` built from actual
+  times would be skewed. Tracked as a follow-up in `docs/BACKLOG.md`.
+- **`affected_trip_count` reconciles by route/time window, not by FK.** Each
+  trip stores only its primary `disruption_id`, so when disruptions overlap,
+  counting trips by `disruption_id` can differ from `affected_trip_count`. A
+  trip-disruption bridge table is a possible later enhancement.
 - Weather is independent per observation (no persistence/fronts) and not
   causally linked to `SEVERE_WEATHER` disruptions.
