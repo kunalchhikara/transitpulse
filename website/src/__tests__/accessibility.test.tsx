@@ -37,7 +37,7 @@ describe("accessibility smoke check", () => {
     expect(results).toHaveNoViolations();
   });
 
-  it("has no axe violations on a stub page shell (Live Operations)", async () => {
+  it("has no axe violations on the Live Operations page", async () => {
     const { container } = renderShell(<LiveOperationsPage />);
     const results = await axe(container);
     expect(results).toHaveNoViolations();

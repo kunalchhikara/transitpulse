@@ -8,10 +8,12 @@ Control Centre, Data Quality, Observability, Analytics and Engineering pages, pe
 `PROJECT.md` section 17. Must clearly distinguish LIVE / CONNECTED TEST / RECORDED /
 DEMO and remain useful after the Fabric trial expires.
 
-Status: WE-01 (Website Shell, Navigation & Mode-Indicator Foundation) and WE-02
-(Home Page Content with Static Demo Fixtures) implemented. Remaining scope
-(Live Operations and other page content, live/connected data) is not yet
-implemented — see `docs/BACKLOG.md` (WE-03 onward).
+Status: WE-01 (Website Shell, Navigation & Mode-Indicator Foundation), WE-02
+(Home Page Content with Static Demo Fixtures) and WE-03 (Live Operations
+Page — Demo Mode Fleet View) implemented. Remaining scope (Architecture,
+Data Pipeline, Streaming Lab, Incident Control Centre, Data Quality,
+Observability, Analytics, Engineering page content, live/connected data) is
+not yet implemented — see `docs/BACKLOG.md`.
 
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
