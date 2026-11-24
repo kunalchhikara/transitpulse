@@ -48,14 +48,20 @@ def test_malformed_and_duplicate_together_do_not_crash_and_output_stays_json_ser
     """A duplicate may legitimately replay a payload that was itself
     malformed -- the two scenarios must compose without raising, and the
     result must still be well-formed JSON (even though it may not be a
-    valid TelemetryEvent)."""
+    valid TelemetryEvent). Duplicates are extra deliveries (FU-05), so the
+    count is 60 originals plus one per duplicate fire."""
     injector = build_injector(
         malformed=MalformedDataConfig(enabled=True, probability_per_tick=0.5),
         duplicate=DuplicateConfig(enabled=True, probability_per_tick=0.5),
     )
 
-    payloads = [injector.produce_event(tick) for tick in range(60)]
-    assert len(payloads) == 60
+    payloads: list[dict] = []
+    sink = injector.delivery_sink(payloads.append)
+    for tick in range(60):
+        sink(injector.produce_event(tick))
+    assert injector.duplicates_injected > 0
+    assert len(payloads) == 60 + injector.duplicates_injected
+    assert len({p["event_id"] for p in payloads}) == 60, "every original delivered, none replaced"
     for payload in payloads:
         json.dumps(payload, default=str)
 
@@ -105,13 +111,23 @@ def test_all_seven_scenarios_enabled_at_once_do_not_crash():
     )
     base_rate = injector.generator_config.events_per_second
 
-    payloads: list[object] = []
+    payloads: list[dict] = []
     clock = FakeClock()
-    summary = run(injector, payloads.append, clock=clock, max_events=60, rate_multiplier=injector.rate_multiplier)
+    summary = run(
+        injector,
+        injector.delivery_sink(payloads.append),
+        clock=clock,
+        max_events=60,
+        rate_multiplier=injector.rate_multiplier,
+    )
     payloads += injector.flush_pending()
 
     assert summary.events_emitted == 60
-    assert len(payloads) == 60 + 3  # hold_ticks pre-fill, nothing lost -- same accounting as the pairwise test above
+    # hold_ticks pre-fill, nothing lost -- same accounting as the pairwise
+    # test above -- plus one extra delivery per duplicate fire (FU-05).
+    assert injector.duplicates_injected > 0
+    assert len(payloads) == 60 + 3 + injector.duplicates_injected
+    assert len({p["event_id"] for p in payloads}) == 60 + 3
     for payload in payloads:
         json.dumps(payload, default=str)
 

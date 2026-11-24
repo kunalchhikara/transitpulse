@@ -288,7 +288,7 @@ correct fault conditions; see `docs/BACKLOG.md` DE-06/DE-07.
 | # | PROJECT.md §13 scenario | Enable (config) | Enable (CLI flag) | Effect |
 |---|---|---|---|---|
 | 1 | Bad/malformed data | `[incidents.malformed]` `enabled = true` | `--enable-malformed` | Deterministically round-robins through configured `modes`: null `vehicle_id`, invalid lat/long (999/-999), negative `speed_kmh` (-42), non-parsable `event_time` string, unknown `route_id`, or a missing field (`occupancy` dropped) — applied to the raw JSON payload, since a structurally-valid `TelemetryEvent` cannot hold these values. |
-| 2 | Duplicate-event injection | `[incidents.duplicate]` `enabled = true` | `--enable-duplicate` | With probability `probability_per_tick`, replaces the current tick's payload with a verbatim (byte-identical) copy of a payload already delivered within the last `replay_window` deliveries, same `event_id` included. |
+| 2 | Duplicate-event injection | `[incidents.duplicate]` `enabled = true` | `--enable-duplicate` | With probability `probability_per_tick`, delivers one *extra* verbatim (byte-identical) copy of an original payload delivered on an earlier tick, chosen from the last `replay_window` originals, same `event_id` included. A duplicate is an addition, never a replacement: the current tick's own payload is still delivered, and the replay follows immediately after it (see "Duplicate delivery and `--max-events`" below). |
 | 3 | Late-event injection | `[incidents.late_event]` `enabled = true` | `--enable-late-event` | With probability `probability_per_tick`, subtracts a uniformly-sampled `[min_skew_seconds, max_skew_seconds]` skew from `event_time` only (`generated_at` unchanged), guaranteed `>= late_threshold_seconds` by config validation. |
 | 4 | Out-of-order delivery | `[incidents.out_of_order]` `enabled = true` | `--enable-out-of-order` | A `hold_ticks`-deep reorder buffer, pre-filled before the run starts; each delivery pushes the newest payload in and (with probability `probability_per_tick`) pops a *random* buffered payload instead of the oldest — genuine reordering, with no event lost or duplicated (call `IncidentInjector.flush_pending()` to drain the final `hold_ticks` events at the end of a bounded run). |
 | 5 | Route congestion | `[incidents.congestion]` `enabled = true` | `--enable-congestion` | For every event on `route_id`, inside `window` (`[start_tick, start_tick + duration_ticks)`), multiplies `speed_kmh` by `speed_multiplier` (default 0.3) and adds `extra_delay_seconds` (default 240) to `delay_seconds`, recomputing `status` against the generator's own `delayed_status_threshold_seconds`. |
@@ -332,6 +332,37 @@ with what parameters) go to stderr/`--log-file` via the
 `simulator.incidents` logger, reusing DE-02's `JsonLinesFormatter`
 (`simulator/incidents/logging_setup.py`) — never interleaved with the event
 stream.
+
+### Duplicate delivery and `--max-events`
+
+A duplicate fire queues its replay inside the injector rather than
+returning it from `produce_event` (which always returns the next *original*
+payload). `IncidentInjector.delivery_sink(sink)` wraps the output sink so
+each queued replay is written straight after the original that triggered
+it, inside the same `runner.run()` iteration: it takes no generator tick,
+no RNG draw beyond the duplicate decision itself, and no extra pacing slot
+(a replay is a same-instant redelivery burst, as at-least-once transports
+produce). `runner.run()` itself is unchanged: `max_events` still counts
+`produce_event` calls. Consequently, for the incidents CLI:
+
+- `--max-events N` = N generator ticks in the paced main loop = N original
+  events (plus the `hold_ticks` pre-filled originals flushed at the end when
+  out-of-order is enabled), each delivered exactly once;
+- total output lines = originals + duplicate fires;
+- the set of delivered `event_id`s is identical with duplicates on or off
+  (same seed and config), and each repeated `event_id` appears once per
+  logged `"duplicate incident fired"` line naming it as
+  `replayed_event_id` (the log also records `delivered_after_event_id`).
+
+Example (`--generator-config simulator/tests/fixtures/fast_generator.toml
+--max-events 300`): duplicates off = 300 lines / 300 distinct; with
+`--enable-duplicate` = 314 lines / the same 300 distinct + 14 logged fires.
+The run-complete log line reports `events_emitted` (main-loop ticks),
+`payloads_delivered` and `duplicates_injected`. A caller looping
+`produce_event` without `delivery_sink` loses nothing:
+`flush_pending()` returns any undelivered replays first, then the
+reorder buffer. (Before FU-05 the replay *replaced* the current payload, so
+each fire silently dropped one original: 300 lines but 286 distinct.)
 
 ### Testing
 
@@ -1446,12 +1477,12 @@ is active (ADR-0004):
 - **No service-area (bounding box) GPS check.** `valid_coordinates` is the
   global lat/lon range; "null island" (0, 0) would pass. A configurable
   Sydney bounding-box rule is a candidate follow-up.
-- **DE-03 duplicate injection replaces the event it fires on**
-  (`IncidentInjector._apply_duplicate` returns the replay instead of the new
-  payload, which is only remembered), so that new event can be missing from
-  the stream, or first arrive later as a "replay". Silver handles both
-  correctly and the test oracle accounts for it; recorded for the DE-03
-  owner.
+- **Resolved (FU-05): DE-03 duplicate injection used to replace the event it
+  fired on**, so that event could be missing from the stream or first arrive
+  later as a "replay". DE-03 now delivers each duplicate as an extra copy
+  after its original (see DE-03 "Duplicate delivery and `--max-events`");
+  `run_incident_stream` mirrors the corrected CLI loop and the DE-06
+  end-to-end/oracle tests pass unchanged against it.
 - Single writer per Silver store (no locking); inputs read fully into memory;
   per-record (not micro-batch) watermark; timestamps truncated to
   microseconds.

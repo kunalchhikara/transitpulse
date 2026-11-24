@@ -16,7 +16,7 @@ FAST_GENERATOR_CONFIG = Path(__file__).resolve().parent / "fixtures" / "fast_gen
 
 
 def test_cli_runs_with_enable_flags_and_writes_valid_json_lines(tmp_path):
-    output_path = tmp_path / "events.ndjson"
+    output_path, log_path = tmp_path / "events.ndjson", tmp_path / "incidents.log"
     result = subprocess.run(
         [
             sys.executable,
@@ -28,6 +28,8 @@ def test_cli_runs_with_enable_flags_and_writes_valid_json_lines(tmp_path):
             "40",
             "--output",
             str(output_path),
+            "--log-file",
+            str(log_path),
             "--enable-malformed",
             "--enable-duplicate",
         ],
@@ -39,9 +41,17 @@ def test_cli_runs_with_enable_flags_and_writes_valid_json_lines(tmp_path):
     assert result.returncode == 0, f"CLI run failed:\nstdout={result.stdout}\nstderr={result.stderr}"
 
     lines = output_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 40
+    log = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    duplicate_fires = sum(1 for r in log if r["message"] == "duplicate incident fired")
+    # --max-events counts originals; each duplicate fire adds one line (FU-05).
+    assert len(lines) == 40 + duplicate_fires
+    assert len({json.loads(line)["event_id"] for line in lines}) == 40
     for line in lines:
         json.loads(line)  # every line is well-formed JSON, malformed or not
+    (complete,) = [r for r in log if r["message"] == "incident-aware generation run complete"]
+    assert complete["context"]["events_emitted"] == 40
+    assert complete["context"]["payloads_delivered"] == len(lines)
+    assert complete["context"]["duplicates_injected"] == duplicate_fires
 
 
 def test_cli_with_no_flags_matches_default_disabled_baseline(tmp_path):

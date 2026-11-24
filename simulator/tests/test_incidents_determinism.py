@@ -33,16 +33,25 @@ def _mixed_incidents_config():
     )
 
 
+def _delivered(injector) -> list[dict]:
+    """Everything delivered by `_EVENT_COUNT` calls, duplicate replays
+    included in their delivery position (as the CLI writes them)."""
+    delivered: list[dict] = []
+    sink = injector.delivery_sink(delivered.append)
+    for tick in range(_EVENT_COUNT):
+        sink(injector.produce_event(tick))
+    return delivered
+
+
 def test_same_seed_and_config_produce_byte_identical_incident_sequences():
     config = _mixed_incidents_config()
     injector_a = build_injector(generator=build_generator(), incidents_config=config)
     injector_b = build_injector(generator=build_generator(), incidents_config=config)
 
-    sequence_a = [injector_a.produce_event(t) for t in range(_EVENT_COUNT)]
-    sequence_b = [injector_b.produce_event(t) for t in range(_EVENT_COUNT)]
-    sequence_a += injector_a.flush_pending()
-    sequence_b += injector_b.flush_pending()
+    sequence_a = _delivered(injector_a) + injector_a.flush_pending()
+    sequence_b = _delivered(injector_b) + injector_b.flush_pending()
 
+    assert injector_a.duplicates_injected > 0, "guard: duplicates must be part of what is compared"
     dumped_a = [json.dumps(p, sort_keys=True, default=str) for p in sequence_a]
     dumped_b = [json.dumps(p, sort_keys=True, default=str) for p in sequence_b]
 
@@ -57,8 +66,8 @@ def test_different_incidents_seed_produces_a_different_sequence():
     injector_a = build_injector(generator=build_generator(), incidents_config=config_a)
     injector_b = build_injector(generator=build_generator(), incidents_config=config_b)
 
-    sequence_a = [injector_a.produce_event(t) for t in range(_EVENT_COUNT)]
-    sequence_b = [injector_b.produce_event(t) for t in range(_EVENT_COUNT)]
+    sequence_a = _delivered(injector_a)
+    sequence_b = _delivered(injector_b)
 
     dumped_a = [json.dumps(p, sort_keys=True, default=str) for p in sequence_a]
     dumped_b = [json.dumps(p, sort_keys=True, default=str) for p in sequence_b]

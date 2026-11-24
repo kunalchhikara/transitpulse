@@ -149,15 +149,15 @@ class IncidentRun:
 
 
 def run_incident_stream(incidents_config: IncidentsConfig, max_events: int) -> IncidentRun:
-    """Run DE-03 exactly like its CLI (DE-02 runner with the rate hook, then
-    flush the reorder buffer), on a fake clock, capturing the structured
-    incident log."""
+    """Run DE-03 exactly like its CLI (DE-02 runner with the rate hook and
+    the injector's duplicate-delivering sink, then flush the reorder
+    buffer), on a fake clock, capturing the structured incident log."""
     stream = io.StringIO()
     configure_incident_logging(level="INFO", stream=stream)
     try:
         injector = IncidentInjector(build_generator(), incidents_config)
         payloads: list[dict[str, Any]] = []
-        run(injector, payloads.append, clock=FakeClock(), max_events=max_events,
+        run(injector, injector.delivery_sink(payloads.append), clock=FakeClock(), max_events=max_events,
             rate_multiplier=injector.rate_multiplier)
         payloads.extend(injector.flush_pending())
     finally:
