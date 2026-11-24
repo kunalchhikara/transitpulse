@@ -1,0 +1,40 @@
+{
+  "tagline": "A portfolio-grade, Azure/Fabric-focused real-time transport data platform — synthetic data only.",
+  "summary": [
+    "TransitPulse models a fictional Sydney public transport operator running buses, routes, stops and depots, so that production-style batch and streaming data engineering can be demonstrated end to end without touching any real operator's systems or data.",
+    "A deterministic simulator generates vehicle telemetry, scheduled trips, passenger journeys and service incidents. That synthetic stream feeds a medallion-style Bronze/Silver/Gold pipeline, data-quality and quarantine logic, and (once the Microsoft Fabric trial is activated) Fabric Lakehouse, Warehouse and real-time processing.",
+    "This website is the public-facing reviewer experience. It is explicitly DEMO mode everywhere right now: every page uses hand-authored static fixtures, not a live or connected backend, and says so."
+  ],
+  "architectureTeaser": "Data moves through a Bronze (raw, replayable), Silver (validated, deduplicated, quarantine-routed) and Gold (business/analytics-ready) layering. The same synthetic telemetry stream is used to demonstrate event-time vs. processing-time handling, windowing, late/duplicate/out-of-order events and incident-driven recovery, all runnable locally before any paid Fabric capacity is involved.",
+  "stats": [
+    {
+      "id": "vehicles",
+      "label": "Fleet vehicles",
+      "value": 50,
+      "unit": "vehicles",
+      "description": "Default simulator fleet size (simulator/config/default_scale.toml)."
+    },
+    {
+      "id": "routes",
+      "label": "Routes",
+      "value": 10,
+      "unit": "routes",
+      "description": "Bus routes across the synthetic Sydney-area network."
+    },
+    {
+      "id": "stops",
+      "label": "Stops",
+      "value": 150,
+      "unit": "stops",
+      "description": "Served stops, within the 100-200 configured range."
+    },
+    {
+      "id": "depots",
+      "label": "Depots",
+      "value": 4,
+      "unit": "depots",
+      "description": "Operator depots housing the fleet."
+    }
+  ],
+  "fixtureNote": "These figures are illustrative demo numbers taken from the default local simulator scale configuration. They are static and hand-authored for this page, not a live reading from a running simulator or Fabric pipeline."
+}

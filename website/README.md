@@ -8,9 +8,10 @@ Control Centre, Data Quality, Observability, Analytics and Engineering pages, pe
 `PROJECT.md` section 17. Must clearly distinguish LIVE / CONNECTED TEST / RECORDED /
 DEMO and remain useful after the Fabric trial expires.
 
-Status: WE-01 (Website Shell, Navigation & Mode-Indicator Foundation) implemented.
-Remaining scope (page content, live/connected data) is not yet implemented — see
-`docs/BACKLOG.md` (WE-02, WE-03).
+Status: WE-01 (Website Shell, Navigation & Mode-Indicator Foundation) and WE-02
+(Home Page Content with Static Demo Fixtures) implemented. Remaining scope
+(Live Operations and other page content, live/connected data) is not yet
+implemented — see `docs/BACKLOG.md` (WE-03 onward).
 
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
@@ -126,3 +127,35 @@ stays consistent until each page's real content story lands.
 - No mapping/charting library is selected yet (deliberately deferred per
   the backlog — a later, separately-approved story). Pages that will
   eventually need one use a plain placeholder in the meantime.
+
+### Home page fixture (WE-02)
+
+Status: WE-02 (Home Page Content with Static Demo Fixtures) implemented.
+Home now has real content; the remaining 9 pages are still WE-01 stubs
+pending their own content stories (e.g. WE-03 for Live Operations).
+
+Home's content lives in a small, hand-authored static fixture rather than
+inline JSX strings, so the "this page is backed by a fixture, not a live
+source" pattern is explicit and reusable for later pages:
+
+- **Fixture file**: `src/fixtures/home.json` — plain static JSON, imported
+  directly (`resolveJsonModule` is on in `tsconfig.json`). This is the
+  convention for all future page fixtures too: `src/fixtures/<page>.json`.
+- **Type contract**: `src/lib/homeFixture.ts` defines `HomeFixture`/
+  `HomeStat` and two checks:
+  - a **compile-time** check — `src/app/page.tsx` assigns the imported JSON
+    through `assertHomeFixture`, so a shape mismatch is a type/build error;
+  - a **runtime** check — `assertHomeFixture` throws (and `isHomeFixture`
+    is the underlying type guard) if the fixture is malformed, so a bad
+    hand-edit to the JSON fails loudly instead of rendering broken content.
+  `src/lib/homeFixture.test.ts` exercises both the real fixture and a set
+  of deliberately malformed shapes against this contract.
+- **Numbers shown are illustrative, not live.** The stat block values (50
+  vehicles / 10 routes / 150 stops / 4 depots) mirror
+  `simulator/config/default_scale.toml`'s defaults, copied by hand into the
+  fixture — this is a documented *contract*, not a code/data dependency on
+  the simulator. There is no fetch, no simulator invocation, and no Fabric
+  call behind this page; `ModeIndicator` stays `DEMO` accordingly, and
+  `fixtureNote` in the fixture says so in-page as well.
+- Nav links on Home are rendered from `NAV_ITEMS` (`src/lib/navigation.ts`),
+  never hand-duplicated, so the page can't drift from the real routes.
