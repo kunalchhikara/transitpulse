@@ -10,10 +10,12 @@ Bronze/Silver/Gold transformation logic that can be tested without Fabric, per
 Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
 (Deterministic Simulator Core Engine), DE-03 (Incident Injection Scenarios in
 Simulator), DE-04 (Synthetic Batch & Historical Datasets), DE-05 (Local
-Bronze Layer Ingestion Logic) and DE-06 (Local Silver Layer for the telemetry
-stream) implemented, all local only (IMPLEMENTED - NOT CONNECTED). Remaining
-scope (Gold, DE-07; Silver for the DE-04 batch datasets) is not yet
-implemented — see `docs/BACKLOG.md`.
+Bronze Layer Ingestion Logic), DE-06 (Local Silver Layer for the telemetry
+stream) and DE-07 (Local Gold Layer Groundwork - minimal route performance
+aggregate) implemented, all local only (IMPLEMENTED - NOT CONNECTED).
+Remaining local work: Silver for the DE-04 batch datasets and the QA
+follow-ups (FU-01..FU-08) in `docs/BACKLOG.md`; the full PROJECT.md section
+10 dimensional model is the later Warehouse story.
 
 ## Dependency choice: Pydantic
 
@@ -1486,3 +1488,304 @@ is active (ADR-0004):
 - Single writer per Silver store (no locking); inputs read fully into memory;
   per-record (not micro-batch) watermark; timestamps truncated to
   microseconds.
+
+## DE-07: Local Gold Layer Groundwork (route performance aggregate)
+
+**Status: IMPLEMENTED - NOT CONNECTED.** `simulator/gold/` is local Python
+that reads the local DE-06 Silver store and writes local files. No Fabric
+Lakehouse, Warehouse, OneLake, semantic model or any other Azure/Fabric
+resource has been created, read or written. Nothing here is evidence of
+Fabric execution.
+
+**Scope: groundwork, not the full PROJECT.md section 10 model.** DE-07 adds
+one small aggregate, `route_performance`, to close the local
+Bronze -> Silver -> Gold chain. It does **not** implement `dim_*`/`fact_*`
+tables, `dim_date`/`dim_time`, SCD Type 2, Warehouse SQL, a Power BI
+semantic model, or the vehicle/trip/passenger/incident Gold facts. Those
+belong to the later Warehouse/dimensional-model story in `docs/BACKLOG.md`.
+That story also needs FU-01, which aligns live and scheduled trip ids before
+`fact_route_performance` can be joined to the timetable. This aggregate is
+an input that story can build on, not a replacement for it.
+
+### CLI usage
+
+```
+python -m simulator.incidents --enable-malformed --enable-duplicate --enable-late-event \
+  --enable-out-of-order --max-events 500 --output events.ndjson
+python -m simulator.bronze stream --input events.ndjson --run-id b1
+python -m simulator.silver --run-id s1
+python -m simulator.gold --run-id g1
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--run-id ID` | generated (`gold-<UTC>-<8 hex>`) | Gold run identifier (same alphabet as Bronze/Silver run ids). Pass one for reproducible or idempotent reruns. |
+| `--silver-dir PATH` | config `silver_dir` (`simulator/_out/silver`) | Silver store root. |
+| `--output-dir PATH` | config `output_dir` (`simulator/_out/gold`, gitignored) | Gold store root. |
+| `--silver-run-id ID` | the latest committed Silver run | Aggregate exactly this committed Silver run. |
+| `--fixed-processing-time ISO` | wall clock | Inject a fixed clock (must carry an offset) for byte-reproducible output. |
+| `--gold-config PATH` | `simulator/gold/default_gold.toml` | Alternate Gold config. |
+| `--scale-config PATH` | DE-01 `default_scale.toml` | Reference data (route names, known routes). It must be the one Silver used: Gold checks it against the Silver manifest's `reference_sha256`. |
+| `--log-file PATH` / `--log-level LEVEL` | stderr / `INFO` | Structured JSON-lines logs (DE-02 formatter, logger `simulator.gold`). |
+
+The CLI prints one JSON summary line to stdout: `status`, `run_id`,
+`manifest`, `silver_runs_consumed`, `silver_selection`, the main counters
+and `reconciliation_holds`. On failure it prints `status: FAILED`,
+`error_type` and `error`. Exit code 0 means committed, or already committed
+with identical input. Exit code 1 means the run was refused or failed, and
+nothing was committed. Library API: `simulator.gold.run_gold(...)`.
+
+### Input: one committed Silver run, read through its manifest
+
+Gold reads Silver the same way Silver reads Bronze (BACKLOG DE-07 "Silver
+input contract"). It never globs Silver data directories. It lists
+`_runs/*.json` and keeps only manifests with `layer: "silver"` and
+`status: "COMMITTED"`, so FAILED or crashed runs and their orphaned
+partitions are invisible. Before using a committed manifest, Gold checks
+that its run_id matches its file name, that it has a supported
+`silver_manifest_version`, that `reconciliation.holds` is true, and that its
+table paths are relative and contain no `..`. Gold then finds each table
+through `tables.<role>.path` (`clean`, `quarantine`, `duplicates`) and
+verifies it before using any row: the file must exist, its sha256 must match
+the manifest, and its line count must equal both the manifest's `records`
+and the matching Silver counter (`valid_loaded` / `quarantined` /
+`duplicates_excluded`). Every record must also carry this `silver_run_id`.
+Any mismatch raises `GoldInputError` and nothing is committed.
+
+**Why one run, and why the latest by default.** Each Silver run is a
+complete snapshot of the Bronze runs it consumed, with dedup and watermark
+state scoped to the run (DE-06 "Output layout" and "Known limitations").
+Unioning two Silver runs would therefore count every shared event twice, so
+Gold consumes exactly one. By default that is the latest committed run,
+meaning the greatest `processing_time` with ties broken by `run_id`, because
+the latest snapshot is the most complete view. `--silver-run-id` pins a
+specific run, for example to reproduce an earlier Gold result. The choice is
+recorded in the manifest as `silver_selection` (`latest_committed` or
+`explicit`).
+
+### Aggregate definition (`route_performance`)
+
+The grain is one row per (`route_id`, period). A row exists if the cell has
+at least one clean record or at least one attributed quarantined record.
+Rows are ordered by (`period_start`, `route_id`).
+
+| Column | Definition |
+|---|---|
+| `route_id`, `route_number`, `route_name` | Route, with `ref_route_number`/`ref_route_name` from the Silver clean records (DE-01 reference). A route that has only quarantined records takes its names from the same reference data. |
+| `period_start`, `period_end` | Bucket `[period_start, period_end)` in UTC (`...Z`, microseconds, the same format as Silver timestamps). |
+| `period_start_local`, `period_end_local` | The same instants at the fixed local offset (`+10:00` by default). |
+| `period_minutes` | Bucket length (config). |
+| `event_count` | Silver **clean** records of the route whose `event_time` falls in the bucket. **Late and out-of-order rows are included.** |
+| `avg_delay_seconds` | `sum_delay_seconds / event_count`, rounded to 4 dp. Null when `event_count == 0`. |
+| `sum_delay_seconds` | Sum of `delay_seconds` over those records. Kept because averages are not additive, so a later rollup (daily, all routes) must use sum / count rather than average the averages. |
+| `late_event_count`, `out_of_order_event_count` | How many of `event_count` Silver flagged `late` / `out_of_order` (`_silver_event_time_status`). |
+| `quarantined_count` | Silver quarantine records **attributed** to this route and bucket (see below). |
+| `valid_percentage` | `100 * event_count / (event_count + quarantined_count)`, rounded to 4 dp. |
+| `gold_run_id`, `silver_run_id`, `processing_time` | Lineage (`processing_time` is the Gold run's injectable clock, stamped once per run). |
+
+**Exclusions.** Quarantined records and excluded duplicates never reach
+`event_count`, `avg_delay_seconds` or `sum_delay_seconds`, because they are
+not in the Silver clean table. A duplicate is counted once, with the value of
+its first valid arrival (Silver's dedup winner). Duplicates are also kept
+out of the `valid_percentage` denominator, the same convention as Silver's
+`quality_percentage`: a replay is a delivery issue, not a data-quality
+failure.
+
+**Late rows are included, never filtered.** Silver loads late events and
+flags them. A historical aggregate must count every valid observation, so
+`late_event_count` makes their share visible without dropping them. Only a
+future streaming aggregate over closed windows may exclude late rows, with
+one predicate on `_silver_event_time_status`.
+
+### Period and timezone
+
+Buckets are `period_minutes` long (default 60, which gives hourly route
+performance). They are aligned to **local midnight at a fixed UTC offset**
+(`utc_offset_hours`, default +10 AEST, no daylight saving). That is the same
+convention DE-04 uses for its local service dates (`default_batch.toml`).
+Timestamps are stored in UTC, because Silver standardises `event_time` to
+UTC and Fabric/Spark timestamps are UTC instants. Each bucket is also
+labelled in local time. With a whole-hour offset and hourly buckets, the UTC
+and local bucket boundaries are identical, so the offset only changes the
+`*_local` labels. With `period_minutes = 1440` it makes a bucket a local
+service day (14:00 UTC to 14:00 UTC) rather than a UTC day, which keeps
+Gold consistent with DE-04's `event_date`. `period_minutes` must divide 1440
+so that boundaries line up every day (validated). `event_time` is the
+bucket key, not ingestion or processing time, so a late event lands in the
+period it describes. Limitation: the offset is fixed, so real Sydney
+daylight saving (+11) is not modelled. This is the same limitation as DE-04.
+
+### Quarantine attribution and `valid_percentage`
+
+Some quarantined records lack a usable route or time, for example DE-03's
+`missing_field`, `malformed_timestamp` and `unknown_route` modes, or a
+truncated line. Each quarantined record is therefore **attributed** to a
+(route, bucket) only when all of the following hold. Otherwise it is counted
+once in an explicit **unattributed** total, under the first reason that
+applies:
+
+| # | Condition for attribution | Unattributed reason if it fails |
+|---|---|---|
+| 1 | The record is a JSON object (not a Bronze parse error). | `bronze_parse_error` |
+| 2 | Silver kept its parsed form (`raw_payload` not null; null means `raw_payload_omitted_reasons` such as `non_finite_number` / `unpaired_surrogate`). | `raw_payload_unavailable` |
+| 3 | `route_id` is a string naming a DE-01 reference route. An unknown route has no row of its own, because a Warehouse fact row would have no `dim_route` member. | `route_id_missing_or_unknown` |
+| 4 | `event_time` is an ISO-8601 string with a UTC offset (Silver's `parsable_timestamps` check) and its bucket is representable. | `event_time_unparseable` |
+| 5 | Silver did not reject the record *because of* its event_time (`future_time_tolerance` not in `rejection_rules`), since that time would place it in the wrong period. | `event_time_rejected` |
+
+So a record with a null `vehicle_id`, an invalid coordinate or a negative
+speed, but an intact route and time, lowers that route's `valid_percentage`
+for that bucket. A record that cannot be placed lowers only the run-level
+figure. Run totals are in the manifest: `quarantined_attributed`,
+`quarantined_unattributed`, `unattributed_by_reason`, and
+`overall_valid_percentage = 100 * valid_loaded / (valid_loaded +
+quarantined)`. The last one must equal Silver's `quality_percentage` and is
+checked.
+
+### Reconciliation identity (asserted before commit)
+
+`simulator.gold.pipeline.reconcile` checks the following from independently
+obtained numbers: row sums, records actually read, the Silver manifest's
+counters, and lines actually written. The results are recorded in
+`reconciliation` (`identities`, `checks`, `holds`, `formula`). Any failure
+raises `GoldAccountingError`. In that case nothing is published and a FAILED
+manifest names the failing checks.
+
+```
+sum(rows.event_count)                             == clean records read == silver.valid_loaded
+quarantined_attributed + quarantined_unattributed == quarantine records read == silver.quarantined
+sum(rows.quarantined_count)                       == quarantined_attributed
+sum(unattributed_by_reason)                       == quarantined_unattributed
+sum(rows.late_event_count)                        == silver.late
+sum(rows.out_of_order_event_count)                == silver.out_of_order
+sum(rows.sum_delay_seconds)                       == sum(delay_seconds) over clean records read
+silver.extracted == silver.valid_loaded + silver.quarantined + silver.duplicates_excluded
+overall_valid_percentage                          == silver.quality_percentage
+lines in the JSONL (and CSV, minus header)        == number of rows
+```
+
+With DE-05 and DE-06 this gives the full chain: input lines -> Bronze
+`records_written` -> Silver `extracted` = clean + quarantined + duplicates
+-> Gold `event_count` (clean) + attributed/unattributed (quarantined), with
+duplicates recorded as excluded.
+
+### Output, lineage and manifest
+
+```
+<output_dir>/                                       (default simulator/_out/gold, gitignored)
+  route_performance/run_id=<id>/part-00000.jsonl    canonical aggregate (JSON lines)
+  route_performance/run_id=<id>/part-00000.csv      same rows and column order (write_csv)
+  _runs/<id>.json                                   run manifest: audit record AND commit marker
+  _staging/<id>/...                                 in-flight run, never read, removed on finish
+```
+
+The commit protocol reuses DE-05's `BronzeStore` primitives by import, as
+Silver does: staging, atomic directory rename, and the manifest written
+last. **A Gold run is committed if and only if `_runs/<id>.json` says
+`COMMITTED`.** The manifest (sorted keys) records `run_id`, `status`,
+`processing_time`, `started_at`/`ended_at`/`duration_seconds`,
+`input_fingerprint` and `previous_attempts` (FU-03-style audit of failed
+attempts). It records `silver_selection` and `silver_runs_consumed`: the
+Silver run id, its `processing_time` and `input_fingerprint`, the Bronze run
+ids behind it and which of them were DE-05 replays, its three tables (path
+relative to the Silver root, sha256, records), its main counters, and
+`silver_to_gold_latency_seconds`. It also records `config`,
+`reference_sha256`, `aggregate_definition` (the formulas above, verbatim),
+`tables.route_performance` (path, sha256, records, CSV path and sha256,
+columns), `counters`, `reconciliation`, `removed_uncommitted_paths` and
+`error`. Store roots and local absolute paths are never recorded (FU-04).
+
+### Idempotency and reruns
+
+| Situation | Behaviour |
+|---|---|
+| Same run_id, same input fingerprint, committed | No-op: `ALREADY_COMMITTED`, nothing written (byte-identical even under a later clock). |
+| Same run_id, different fingerprint (another Silver run or Silver tables, Gold config, reference data) | Refused: `GoldRunIdConflictError`. A committed run is never overwritten. With the default selection this includes "a newer Silver run now exists". Use a new Gold run_id, or pin `--silver-run-id`. |
+| Same run_id after a FAILED or crashed attempt | Retried from scratch. Orphaned staging and partitions are removed (`removed_uncommitted_paths`) and the failed attempt is kept in `previous_attempts`. |
+
+Same Silver input, same Gold run_id and a fixed clock produce byte-identical
+JSONL, CSV and manifest in any store, in-process or across separate CLI
+processes (tested).
+
+### Configuration: `simulator/gold/default_gold.toml`
+
+Validated by `simulator/gold/config.py` (pydantic, unknown keys rejected):
+`output_dir`, `silver_dir`, `route_performance_table`, `period_minutes`
+(must divide 1440), `utc_offset_hours` (-12..14), `write_csv`.
+
+### Mapping to Fabric
+
+None of this is implemented or connected. It is the intended translation
+once the Fabric trial is active (ADR-0002, ADR-0004):
+
+| Local (DE-07) | Fabric equivalent |
+|---|---|
+| Read one committed Silver run via its manifest | Read the `silver_telemetry_clean` / `_quarantine` Delta tables at a pinned table version (time travel), recorded in the run-audit table. |
+| Hourly bucket at a fixed offset | `F.window("event_time", "1 hour")` (UTC); local labels via `from_utc_timestamp`. |
+| Aggregate | `groupBy("route_id", window).agg(count, avg("delay_seconds"), sum(...), sum(late flag))` in a PySpark notebook. Late rows are included because this is a batch aggregate, not a stateful streaming window. |
+| `route_performance` JSONL/CSV | A Gold Delta table `gold_route_performance` in the Lakehouse `Tables/` area. |
+| Later Warehouse story | `fact_route_performance` in the Fabric Warehouse, keyed to `dim_route`, `dim_date` and `dim_time` and loaded from the Gold table. SCD2 dimensions and the Power BI semantic model are also part of that story, not DE-07. |
+| Manifest + reconciliation assert | `gold_run_audit` Delta table. The notebook raises before the Delta commit if the identity fails. |
+| Staging + rename + manifest commit marker | The Delta transaction (`txnAppId`/`txnVersion` for idempotent reruns). |
+
+### DE-07 tests
+
+`pytest simulator -q` includes 69 Gold tests:
+
+- `test_gold_aggregate.py`: the **hand-computed fixture**. A 17-line stream
+  (clean, late, duplicate with a conflicting payload, every unattributed
+  reason, quarantine-only cell, bucket-boundary instants, a `+10:00` input
+  timestamp) goes through the real Bronze and Silver code. Its expected rows
+  and totals were worked out by hand in `_gold_helpers.py` (docstring
+  table), not by calling Gold code. A guard test asserts the Silver outcome
+  the hand computation assumes. The file also covers CSV equal to JSONL;
+  quarantined and duplicate exclusion; late inclusion; daily buckets aligned
+  to local midnight; period bucketing incl. negative offsets and pre-1970
+  instants; config validation; and every branch of the attribution rule.
+- `test_gold_reconciliation.py`: identities against counts taken directly
+  from the Silver tables; lineage; a row lost in aggregation fails loudly
+  with nothing committed; a DE-05 replay in the lineage sets
+  `replay_sensitive` and still reconciles (FU-07).
+- `test_gold_idempotency.py`: byte-identical stores (in-process, two CLI
+  processes, moved stores); no-op rerun; conflict on a newer Silver snapshot
+  or a config change; failed-attempt retry with `previous_attempts`; crash
+  leftovers; no local paths in the manifest.
+- `test_gold_silver_contract.py`: no committed Silver run; orphan partition
+  of an uncommitted run; newer FAILED run; latest chosen by processing time;
+  tampered or missing clean/quarantine/duplicates files; re-signed tampering
+  caught by the record-run-id and counter checks; manifest with failed
+  reconciliation or an unsafe path; reference-data mismatch.
+- `test_gold_end_to_end.py`: all seven DE-03 scenarios -> Bronze -> Silver
+  -> Gold through the four real CLIs as separate processes. Reconciliation
+  is checked against the Silver tables, with per-(route, hour) counts and
+  delay sums recomputed independently. Congestion makes ROUTE-01 the
+  slowest route. A second Gold process produces byte-identical output.
+- `test_gold_cli.py`: exit codes and the summary line, the no-op rerun,
+  missing input, unknown Silver run, run-id conflict, alternate config and
+  an invalid run id.
+
+### Known limitations (DE-07)
+
+- **Not connected to Fabric** (see status above). Local filesystem only.
+- **Groundwork only.** One aggregate, with no dimensional model, SCD2,
+  Warehouse or Power BI (see the scope note at the top of this section).
+- **Replay-sensitive quality metrics (BACKLOG FU-07).** Silver quarantines
+  each delivery of a rejected record, so a DE-05 `--allow-replay` run
+  inflates `quarantined_count` and lowers `valid_percentage`. Valid events
+  are not affected, because their replays are excluded duplicates. Gold
+  flags this (`counters.replay_sensitive`, `replayed_bronze_runs`, plus a
+  WARNING log) but does not correct it. It should be fixed in Silver before
+  the Data Quality page uses these numbers.
+- **Late flags inherit FU-06.** `late_event_count` is Silver's flag. A
+  future-dated valid outlier can mis-flag later events as late. This does
+  not change `event_count` or averages, because late rows are included
+  either way.
+- **Attribution sees only the failing Silver stage.** Silver evaluates
+  stage-2 rules (including `future_time_tolerance`) only for records that
+  pass stage 1. So a record with, for example, a negative speed *and* a
+  far-future `event_time` is attributed to that future bucket.
+- **Full recompute per run.** There is no incremental Gold or watermark, and
+  inputs are read fully into memory (local scale). Single writer per Gold
+  store.
+- **Fixed UTC offset.** No daylight saving, as in DE-04.
+- **`delay_seconds` is unbounded in Silver (FU-08).** An absurd but valid
+  delay is averaged as-is.
