@@ -38,11 +38,14 @@ verify_source_manifest = true
 # Name of the DE-04 control file in batch_source_dir.
 source_manifest_file = "manifest.json"
 # What to do when the number of source rows at or below a dataset's current
-# watermark differs from what was recorded when that watermark was set
-# (rows appeared "behind" the watermark, or vanished):
-#   "fail"   - the dataset fails loudly, watermark unchanged (default).
-#   "record" - count it in the audit record, log a warning and continue (the
-#              late rows are NOT extracted).
+# watermark (the maximum committed updated_at) differs from what was recorded
+# when that watermark was committed (rows appeared at/behind the watermark -
+# including a tie with it - or vanished):
+#   "fail"   - the dataset fails loudly, control unchanged (default).
+#   "record" - the late rows are NOT extracted, but never hidden: counted in
+#              the audit record (late_rows_skipped), totalled in pipeline.json
+#              (late_rows_skipped, warnings), pipeline status
+#              SUCCEEDED_WITH_WARNINGS and CLI exit code 3.
 late_arrival_policy = "fail"
 # Bronze run-id prefixes (deterministic run id = prefix-dataset-window).
 incremental_run_id_prefix = "inc"

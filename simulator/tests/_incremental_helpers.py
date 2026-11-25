@@ -58,25 +58,45 @@ class SimulatedCrash(BaseException):
 # -- sources -------------------------------------------------------------------
 
 
-def sample_batch_config(service_days: int = 1) -> BatchConfig:
-    data = load_batch_config(SAMPLE_BATCH_CONFIG).model_dump(mode="python")
+#: DE-04/DE-01 config profiles: "sample" (small, fast; the committed sample
+#: fixture's configs) and "default" (the bundled default_batch.toml +
+#: default_scale.toml that `python -m simulator.batch` uses - the QA repro).
+PROFILES: dict[str, tuple[Path | None, Path | None]] = {
+    "sample": (SAMPLE_BATCH_CONFIG, SAMPLE_SCALE_CONFIG),
+    "default": (None, None),
+}
+
+
+def sample_batch_config(
+    service_days: int = 1, *, profile: str = "sample", overrides: dict[str, dict[str, Any]] | None = None
+) -> BatchConfig:
+    data = load_batch_config(PROFILES[profile][0]).model_dump(mode="python")
     data["batch"]["service_days"] = service_days
+    for section, values in (overrides or {}).items():
+        data[section].update(values)
     return BatchConfig.model_validate(data)
 
 
-def write_batch_source(directory: Path, service_days: int = 1) -> dict[str, Any]:
-    """Generate the DE-04 sample-config source (`service_days` days) into
-    `directory` through DE-04's public API; returns its manifest."""
-    batch_config = sample_batch_config(service_days)
-    scale_config = load_scale_config(SAMPLE_SCALE_CONFIG)
+def write_batch_source(
+    directory: Path,
+    service_days: int = 1,
+    *,
+    profile: str = "sample",
+    overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Generate a DE-04 source (`service_days` days of the `profile` config,
+    optional per-section `overrides`) into `directory` through DE-04's public
+    API; returns its manifest."""
+    batch_config = sample_batch_config(service_days, profile=profile, overrides=overrides)
+    scale_config = load_scale_config(PROFILES[profile][1])
     datasets = generate_batch_datasets(batch_config, scale_config)
     return write_batch_datasets(datasets, directory, batch_config=batch_config, scale_config=scale_config)
 
 
-def write_reference_source(directory: Path) -> None:
+def write_reference_source(directory: Path, *, profile: str = "sample") -> None:
     """DE-01 reference entities exactly as `python -m simulator.reference` writes them."""
     directory.mkdir(parents=True, exist_ok=True)
-    data = generate_reference_dataset(load_scale_config(SAMPLE_SCALE_CONFIG)).to_dict()
+    data = generate_reference_dataset(load_scale_config(PROFILES[profile][1])).to_dict()
     for name, rows in data.items():
         (directory / f"{name}.json").write_text(json.dumps(rows, sort_keys=True, indent=2) + "\n")
 
@@ -123,6 +143,19 @@ def expected_keys(batch_dir: Path, dataset: str, upto: datetime, after: datetime
 
 def all_watermarks(batch_dir: Path) -> list[datetime]:
     return sorted({source_watermark(row, ds) for ds in INCREMENTAL_DATASETS for row in source_rows(batch_dir, ds)})
+
+
+def assert_bronze_matches_source(bronze_dir: Path, batch_dir: Path, upto: datetime) -> None:
+    """The no-loss/no-duplicate oracle: for every incremental dataset, the
+    primary keys in Bronze are exactly the source keys with `updated_at <=
+    upto`, each once - computed from the DE-04 files, not from the loader."""
+    for dataset in INCREMENTAL_DATASETS:
+        landed = bronze_keys(bronze_dir, dataset)
+        expected = expected_keys(batch_dir, dataset, upto)
+        missing = expected - landed
+        extra = landed - expected
+        assert not missing and not extra, (dataset, sum(missing.values()), sum(extra.values()))
+        assert not landed or max(landed.values()) == 1, f"{dataset}: a key was extracted twice"
 
 
 # -- Bronze --------------------------------------------------------------------
@@ -189,6 +222,9 @@ class Env:
         directory = self.state_dir / "audit" / pipeline_run_id / dataset
         return [json.loads(p.read_text()) for p in sorted(directory.glob("attempt-*.json"))]
 
+    def pipeline_summary(self, result: PipelineResult) -> dict[str, Any]:
+        return json.loads((self.state_dir / result.summary_path).read_text())
+
     def run(self, as_of: datetime, *, clock: ManualClock | None = None, **kwargs: Any) -> PipelineResult:
         return run_incremental_load(
             as_of, config=self.config, clock=clock if clock is not None else ManualClock(FIXED_NOW), **kwargs
@@ -212,13 +248,15 @@ def make_config(base: Path, **overrides: Any) -> IncrementalConfig:
     return IncrementalConfig.model_validate(data)
 
 
-def make_env(root: Path, *, service_days: int = 1, relative: bool = False, **overrides: Any) -> Env:
+def make_env(
+    root: Path, *, service_days: int = 1, relative: bool = False, profile: str = "sample", **overrides: Any
+) -> Env:
     """Sources under `root`; config paths absolute, or relative to `root`
     (`relative=True`, for byte-identical comparisons across roots - the
     caller must chdir into `root`)."""
     root.mkdir(parents=True, exist_ok=True)
-    write_batch_source(root / "batch", service_days)
-    write_reference_source(root / "ref")
+    write_batch_source(root / "batch", service_days, profile=profile)
+    write_reference_source(root / "ref", profile=profile)
     return Env(root, make_config(Path(".") if relative else root, **overrides))
 
 

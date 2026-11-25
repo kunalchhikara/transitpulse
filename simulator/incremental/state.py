@@ -33,14 +33,26 @@ CONTROL_DIR_NAME = "control"
 AUDIT_DIR_NAME = "audit"
 EXTRACTS_DIR_NAME = "extracts"
 PIPELINE_SUMMARY_FILE = "pipeline.json"
-CONTROL_SCHEMA_VERSION = "1.0.0"
-AUDIT_SCHEMA_VERSION = "1.0.0"
+#: 2.0.0: `watermark` is the maximum committed `updated_at` (was the window
+#: upper bound in 1.0.0) and `last_as_of` is recorded separately. A 1.0.0
+#: record is refused, never reinterpreted (`ControlSchemaError`).
+CONTROL_SCHEMA_VERSION = "2.0.0"
+#: 2.0.0: adds `last_as_of_before/after`, `late_rows_recovered`,
+#: `late_rows_skipped`, `window_max_watermark`, `preserved_bad_rows`; the
+#: pipeline summary adds `late_rows_skipped` and `warnings`.
+AUDIT_SCHEMA_VERSION = "2.0.0"
 PIPELINE_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _AUTO_PIPELINE_RUN_ID = re.compile(r"^ipr-(\d{6})-")
 
 
 class StateError(Exception):
     """Control/audit store misuse (e.g. an existing audit record or pipeline run id)."""
+
+
+class ControlSchemaError(StateError):
+    """A control record written by another control schema version. Refused
+    before anything is written: a 1.0.0 watermark (window upper bound) read
+    as a 2.0.0 watermark (max committed `updated_at`) would skip rows."""
 
 
 def dump_json(value: dict[str, Any]) -> str:
@@ -107,8 +119,17 @@ class ControlStore:
         if not path.exists():
             return None
         record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("control_schema_version") != CONTROL_SCHEMA_VERSION or record.get("dataset") != dataset:
-            raise StateError(f"control record for {dataset!r} has an unexpected shape/version")
+        if not isinstance(record, dict) or record.get("dataset") != dataset:
+            raise StateError(f"control record for {dataset!r} has an unexpected shape")
+        version = record.get("control_schema_version")
+        if version != CONTROL_SCHEMA_VERSION:
+            raise ControlSchemaError(
+                f"control record for {dataset!r} has control_schema_version {version!r} "
+                f"(watermark_semantics {record.get('watermark_semantics')!r}); this loader reads only "
+                f"{CONTROL_SCHEMA_VERSION!r} (watermark = maximum committed updated_at, last_as_of kept "
+                "separately). An older record is never reinterpreted: reset the series (delete "
+                "<state_dir>/control/ and use a fresh Bronze store) and reload"
+            )
         return record
 
     def write(self, record: dict[str, Any]) -> None:

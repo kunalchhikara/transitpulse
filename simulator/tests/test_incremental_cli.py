@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from simulator.incremental import format_ts
+from simulator.incremental import format_ts, parse_aware
 from simulator.tests._incremental_helpers import (
     all_watermarks,
     make_env,
@@ -78,6 +78,40 @@ def test_exit_codes_and_summary(tmp_path):
     result = json.loads(later.stdout)
     assert result["status"] == "PARTIAL"
     assert result["datasets"]["historical_trips"]["error_type"] == "BadSourceError"
+
+
+def test_skipped_late_rows_under_record_policy_exit_3(tmp_path):
+    """O1: `record` must not hide loss - a distinct exit code."""
+    root = tmp_path / "late"
+    _, values = _cli_env(root)
+    first = run_cli("--as-of", format_ts(values[len(values) // 2]), *COMMON, cwd=root)
+    assert first.returncode == 0
+    control = json.loads((root / "state" / "control" / "historical_trips.json").read_text())
+    rows = [json.loads(line) for line in (root / "batch" / "historical_trips.jsonl").read_text().splitlines()]
+    late = dict(next(r for r in rows if parse_aware(r["updated_at"]) < parse_aware(control["watermark"])))
+    late["trip_id"] += "-LATE"
+    data = (root / "batch" / "historical_trips.jsonl").read_bytes() + json.dumps(late).encode() + b"\n"
+    rewrite_source_file(root / "batch", "historical_trips", data)
+    args = ("--as-of", format_ts(values[-1]), *COMMON)
+    proc = run_cli(*args, "--late-arrival-policy", "record", cwd=root)
+    assert proc.returncode == 3, proc.stderr.decode()
+    summary = json.loads(proc.stdout)
+    assert summary["status"] == "SUCCEEDED_WITH_WARNINGS" and summary["late_rows_skipped"] == 1
+    assert summary["datasets"]["historical_trips"]["late_rows_skipped"] == 1
+    assert summary["warnings"] == [{"count": 1, "dataset": "historical_trips", "type": "late_rows_skipped"}]
+
+
+def test_old_control_schema_is_refused_with_exit_2(tmp_path):
+    root = tmp_path / "old"
+    _, values = _cli_env(root)
+    assert run_cli("--as-of", format_ts(values[3]), *COMMON, cwd=root).returncode == 0
+    path = root / "state" / "control" / "schedules.json"
+    old = json.loads(path.read_text())
+    old["control_schema_version"] = "1.0.0"
+    path.write_text(json.dumps(old))
+    proc = run_cli("--as-of", format_ts(values[-1]), *COMMON, cwd=root)
+    assert proc.returncode == 2 and json.loads(proc.stdout)["status"] == "REFUSED"
+    assert "1.0.0" in json.loads(proc.stdout)["error"]
 
 
 def test_invalid_config_is_refused(tmp_path):

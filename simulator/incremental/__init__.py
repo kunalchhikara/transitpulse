@@ -35,9 +35,11 @@ from simulator.incremental.extract import (
     write_extract,
 )
 from simulator.incremental.loader import (
+    FULL_WATERMARK_SEMANTICS,
     PIPELINE_FAILED,
     PIPELINE_PARTIAL,
     PIPELINE_SUCCEEDED,
+    PIPELINE_SUCCEEDED_WITH_WARNINGS,
     RECONCILIATION_IDENTITY,
     STAGE_BRONZE_COMMITTED,
     STAGE_EXTRACT_WRITTEN,
@@ -61,12 +63,19 @@ from simulator.incremental.loader import (
     bronze_run_id_for,
     run_incremental_load,
 )
-from simulator.incremental.state import AuditStore, ControlStore, StateError
+from simulator.incremental.state import (
+    AuditStore,
+    ControlSchemaError,
+    ControlStore,
+    StateError,
+)
 
 __all__ = [
+    "FULL_WATERMARK_SEMANTICS",
     "PIPELINE_FAILED",
     "PIPELINE_PARTIAL",
     "PIPELINE_SUCCEEDED",
+    "PIPELINE_SUCCEEDED_WITH_WARNINGS",
     "RECONCILIATION_IDENTITY",
     "STAGES",
     "STAGE_BRONZE_COMMITTED",
@@ -83,6 +92,7 @@ __all__ = [
     "BadSourceError",
     "BadSourcePolicy",
     "Clock",
+    "ControlSchemaError",
     "ControlStateMismatchError",
     "ControlStore",
     "DatasetPlan",

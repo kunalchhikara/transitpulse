@@ -54,8 +54,11 @@ def test_initial_load_selects_everything_up_to_as_of(tmp_path):
         expected = expected_keys(env.batch_dir, dataset, as_of)
         assert bronze_keys(env.bronze_dir, dataset) == expected, dataset
         record = env.control(dataset)
-        assert record["watermark"] == format_ts(as_of)
-        assert record["watermark_semantics"] == WATERMARK_SEMANTICS == "window_upper_bound"
+        landed = [source_watermark(r, dataset) for r in source_rows(env.batch_dir, dataset)
+                  if source_watermark(r, dataset) <= as_of]
+        assert record["watermark"] == (format_ts(max(landed)) if landed else None)
+        assert record["last_as_of"] == format_ts(as_of)
+        assert record["watermark_semantics"] == WATERMARK_SEMANTICS == "max_committed_updated_at"
         assert record["last_window"] == {"low": None, "high": format_ts(as_of)}
         assert result.dataset(dataset).status == STATUS_COMMITTED
         assert result.dataset(dataset).extracted_count == sum(expected.values())
@@ -71,17 +74,21 @@ def test_incremental_load_selects_only_the_new_window(tmp_path):
     first = _middle_cut(env)
     second = all_watermarks(env.batch_dir)[-1]
     env.run(first)
+    lows = {d: env.control(d)["watermark"] for d in INCREMENTAL_DATASETS}
+    assert all(lows.values()), "fixture guard: every dataset committed rows at the first cut"
     result = env.run(second)
     for dataset in INCREMENTAL_DATASETS:
+        low = parse_ts(lows[dataset])  # max committed updated_at, <= first
+        assert low <= first
         run_id = result.dataset(dataset).bronze_run_id
-        assert run_id == f"inc-{dataset}-{first:%Y%m%dT%H%M%S}Z-{second:%Y%m%dT%H%M%S}Z"
+        assert run_id == f"inc-{dataset}-{low:%Y%m%dT%H%M%S}Z-{second:%Y%m%dT%H%M%S}Z"
         window_rows = [strip(r) for r in bronze_records(env.bronze_dir, dataset) if r["run_id"] == run_id]
         assert Counter(pk(r, dataset) for r in window_rows) == expected_keys(env.batch_dir, dataset, second, first)
-        assert all(first < source_watermark(r, dataset) <= second for r in window_rows)
+        assert all(low < source_watermark(r, dataset) <= second for r in window_rows)
         # Whole source now in Bronze exactly once.
         assert bronze_keys(env.bronze_dir, dataset) == expected_keys(env.batch_dir, dataset, second)
         assert max(bronze_keys(env.bronze_dir, dataset).values()) == 1
-        assert env.control(dataset)["last_window"] == {"low": format_ts(first), "high": format_ts(second)}
+        assert env.control(dataset)["last_window"] == {"low": lows[dataset], "high": format_ts(second)}
 
 
 def test_full_reference_load_lands_every_entity_with_schema_version(tmp_path):
@@ -125,20 +132,23 @@ def test_watermark_advances_only_after_the_bronze_commit(tmp_path):
 
     def hook(stage, dataset, attempt):
         control = env.control(dataset)
-        watermark = control["watermark"] if control else None
+        last_as_of = control["last_as_of"] if control else None
         run_ids = committed_run_ids(env.bronze_dir)
         committed = any(r.startswith(("inc-" + dataset + "-", "full-" + dataset + "-")) for r in run_ids)
-        seen.append((stage, dataset, watermark, committed))
+        seen.append((stage, dataset, control, last_as_of, committed))
 
     env.run(as_of, hook=hook)
-    for stage, dataset, watermark, committed in seen:
+    for stage, dataset, control, last_as_of, committed in seen:
         if stage == STAGE_EXTRACT_WRITTEN:
-            assert watermark is None and not committed
+            assert control is None and not committed
         elif stage == STAGE_BRONZE_COMMITTED:
-            assert watermark is None and committed, dataset
+            assert control is None and committed, dataset
         else:
             assert stage == STAGE_WATERMARK_WRITTEN
-            assert watermark == format_ts(as_of) and committed
+            assert last_as_of == format_ts(as_of) and committed
+            if dataset in INCREMENTAL_DATASETS:
+                landed = [source_watermark(strip(r), dataset) for r in bronze_records(env.bronze_dir, dataset)]
+                assert control["watermark"] == (format_ts(max(landed)) if landed else None)
     assert {s for s, *_ in seen} == {STAGE_EXTRACT_WRITTEN, STAGE_BRONZE_COMMITTED, STAGE_WATERMARK_WRITTEN}
 
 
@@ -165,7 +175,8 @@ def test_empty_window_is_a_recorded_success_with_zero_rows(tmp_path):
     for dataset in INCREMENTAL_DATASETS:
         outcome = result.dataset(dataset)
         assert outcome.status == STATUS_COMMITTED and outcome.extracted_count == 0
-        assert outcome.watermark_after == format_ts(later)
+        assert outcome.watermark_after == outcome.watermark_before  # empty window: watermark kept
+        assert outcome.last_as_of_after == format_ts(later)
         audit = env.audit_records(result.pipeline_run_id, dataset)[-1]
         assert audit["source_rows_in_window"] == 0 and audit["bronze_records_written"] == 0
         assert audit["reconciliation"]["holds"] is True
@@ -193,7 +204,7 @@ def test_unchanged_reference_reload_is_a_recorded_no_op_and_changes_create_new_r
     for entity in REFERENCE_ENTITIES:
         outcome = result.dataset(entity)
         assert outcome.status == STATUS_SKIPPED_UNCHANGED and outcome.error is None
-        assert outcome.watermark_after == format_ts(t2)
+        assert outcome.watermark_after is None and outcome.last_as_of_after == format_ts(t2)  # full: no watermark
         assert len(bronze_records(env.bronze_dir, entity)) == len(json.loads((env.ref_dir / f"{entity}.json").read_text()))
     assert not any(r.startswith("full-") for r in set(committed_run_ids(env.bronze_dir)) - set(runs_after_first))
 
@@ -254,4 +265,5 @@ def test_as_of_offset_is_normalised_to_utc(tmp_path):
     sydney = as_of.astimezone(timezone(timedelta(hours=10)))
     result = env.run(sydney)
     assert result.as_of == format_ts(as_of)
-    assert env.control(INCREMENTAL_DATASETS[0])["watermark"] == format_ts(as_of)
+    assert env.control(INCREMENTAL_DATASETS[0])["last_as_of"] == format_ts(as_of)
+    assert env.control(INCREMENTAL_DATASETS[0])["watermark"].endswith("Z")

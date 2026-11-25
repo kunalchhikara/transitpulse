@@ -38,7 +38,7 @@ SECTION_15_FIELDS = (
 def test_one_audit_record_per_attempt_with_section_15_fields(tmp_path):
     env = make_env(tmp_path)
     values = all_watermarks(env.batch_dir)
-    env.run(values[2])
+    env.run(values[len(values) // 2])  # every dataset has committed rows: watermarks set
     result = env.run(values[-1])
     for dataset in INCREMENTAL_DATASETS:
         records = env.audit_records(result.pipeline_run_id, dataset)
@@ -55,9 +55,13 @@ def test_one_audit_record_per_attempt_with_section_15_fields(tmp_path):
         assert rec["holds"] is True
         assert record["source_rows_in_window"] == record["extracted_count"] == record["bronze_records_written"]
         assert record["watermark_before"] == record["window_low"]
-        assert record["watermark_after"] == record["window_high"] == result.as_of
+        # Watermark = max committed updated_at; last_as_of = window end.
+        assert record["watermark_after"] == (record["window_max_watermark"] or record["watermark_before"])
+        assert record["last_as_of_after"] == record["window_high"] == result.as_of
+        assert record["late_rows_skipped"] == 0 and record["preserved_bad_rows"] == []
     summary = json.loads((env.state_dir / result.summary_path).read_text())
     assert summary["status"] == "SUCCEEDED" and len(summary["datasets"]) == len(INCREMENTAL_DATASETS) + 4
+    assert summary["late_rows_skipped"] == 0 and summary["warnings"] == []
 
 
 def test_records_are_never_overwritten_and_each_run_gets_its_own_directory(tmp_path):

@@ -7,8 +7,9 @@ records and the same control state as an uninterrupted run."""
 
 from __future__ import annotations
 
+import json
 import shutil
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -22,20 +23,28 @@ from simulator.incremental import (
     STATUS_FAILED,
     STATUS_UP_TO_DATE,
     AsOfError,
+    bronze_run_id_for,
     format_ts,
+    resolve_plan,
 )
 from simulator.tests._incremental_helpers import (
     INCREMENTAL_DATASETS,
     REFERENCE_ENTITIES,
     SimulatedCrash,
     all_watermarks,
+    assert_bronze_matches_source,
     bronze_keys,
     bronze_record_count,
     bronze_records,
     committed_run_ids,
     expected_keys,
     make_env,
+    parse_ts,
+    pk,
+    rewrite_source_file,
+    source_rows,
     tree_bytes,
+    write_batch_source,
 )
 
 DURING_BRONZE = "during_bronze_ingest"
@@ -135,69 +144,164 @@ def test_crash_then_rerun_matches_an_uninterrupted_run(tmp_path, uninterrupted, 
         assert manifest["removed_uncommitted_paths"]
 
 
-def test_later_as_of_after_an_unrecorded_commit_adopts_it_and_matches_uninterrupted(tmp_path, uninterrupted):
+def _three_cuts(env):
+    values = all_watermarks(env.batch_dir)
+    return values[len(values) // 4], values[len(values) // 2], values[-1]
+
+
+def test_later_as_of_after_an_unrecorded_commit_adopts_it_and_matches_uninterrupted(tmp_path):
     """A scheduler's next trigger (a later as_of) after a crash past the
-    Bronze commit: the committed window is adopted, not re-extracted."""
+    Bronze commit of an incremental window: the committed window is adopted
+    (after re-selecting it from the current source), not re-extracted."""
+    clean = make_env(tmp_path / "clean")
+    first, second, third = _three_cuts(clean)
+    for cut in (first, second, third):
+        clean.run(cut)
+
+    env = make_env(tmp_path / "crashed")
+    env.run(first)
+    control_before = env.control(TARGET)
+    with pytest.raises(SimulatedCrash):
+        env.run(second, hook=crash_hook(STAGE_BRONZE_COMMITTED, TARGET))
+    assert env.control(TARGET) == control_before
+    result = env.run(third)
+    outcome = result.dataset(TARGET)
+    assert result.status == "SUCCEEDED" and outcome.status == STATUS_COMMITTED
+    audit = env.audit_records(result.pipeline_run_id, TARGET)[0]
+    low = control_before["watermark"]
+    assert audit["recovered_bronze_run_id"] == bronze_run_id_for(
+        env.config, _plan(env), parse_ts(low), second
+    )
+    assert audit["watermark_before"] == low and audit["last_as_of_before"] == format_ts(first)
+    assert audit["window_low"] == clean.control(TARGET)["last_window"]["low"]
+    assert bronze_record_count(env.bronze_dir) == bronze_record_count(clean.bronze_dir)  # nothing landed twice
+    assert_bronze_matches_source(env.bronze_dir, env.batch_dir, third)
+    # TARGET and every dataset before it went through the same three windows
+    # as the uninterrupted run, so their control records and Bronze rows are
+    # identical. (Datasets after TARGET never ran at `second`.)
+    plan = [*REFERENCE_ENTITIES, *INCREMENTAL_DATASETS]
+    for dataset in plan[: plan.index(TARGET) + 1]:
+        assert env.control(dataset) == clean.control(dataset), dataset
+        assert bronze_records(env.bronze_dir, dataset) == bronze_records(clean.bronze_dir, dataset), dataset
+
+
+def _plan(env, name=TARGET):
+    return next(p for p in resolve_plan(env.config) if p.name == name)
+
+
+def _crash_in_second_window(tmp_path):
+    env = make_env(tmp_path)
+    first, second, third = _three_cuts(env)
+    env.run(first)
+    with pytest.raises(SimulatedCrash):
+        env.run(second, hook=crash_hook(STAGE_BRONZE_COMMITTED, TARGET))
+    return env, first, second, third
+
+
+def _refused_without_landing(env, result, match):
+    outcome = result.dataset(TARGET)
+    assert outcome.status == STATUS_FAILED and outcome.error["type"] == "ControlStateMismatchError"
+    assert match in outcome.error["message"], outcome.error["message"]
+    return outcome
+
+
+def test_adoption_refused_when_the_current_source_no_longer_matches_the_committed_window(tmp_path):
+    """QA: before adopting an interrupted window, it is re-selected from the
+    CURRENT source; a source edited in place (same updated_at, different
+    content) must not be adopted silently."""
+    env, _first, second, third = _crash_in_second_window(tmp_path)
+    control_before = env.control(TARGET)
+    low = parse_ts(control_before["watermark"])
+    data = (env.batch_dir / f"{TARGET}.jsonl").read_bytes()
+    lines = data.split(b"\n")
+    index = next(
+        i for i, line in enumerate(lines)
+        if line.strip() and low < parse_ts(json.loads(line)["updated_at"]) <= second
+    )
+    row = json.loads(lines[index])
+    row["arrival_delay_seconds"] += 1  # in-place edit, updated_at unchanged
+    lines[index] = json.dumps(row).encode()
+    rewrite_source_file(env.batch_dir, TARGET, b"\n".join(lines))
+    target_runs = [r for r in committed_run_ids(env.bronze_dir) if r.startswith(f"inc-{TARGET}-")]
+    result = env.run(third)
+    _refused_without_landing(env, result, "current source")
+    assert [r for r in committed_run_ids(env.bronze_dir) if r.startswith(f"inc-{TARGET}-")] == target_runs
+    assert env.control(TARGET) == control_before
+
+
+def test_adoption_refused_when_no_control_record_exists_qa_repro(tmp_path):
+    """QA repro: load T1; delete control/ but keep Bronze; regenerate DE-04
+    with relief_pool_size=5; run T2. 9a7eac2 adopted every dataset's T1 run
+    silently (51 schedules rows kept a stale depot_id). Lost control means
+    operator action: every dataset is refused and nothing is landed."""
+    t1, t2 = datetime(2025, 1, 12, tzinfo=UTC), datetime(2025, 1, 13, tzinfo=UTC)
+    env = make_env(tmp_path, service_days=7, profile="default")
+    assert env.run(t1).status == "SUCCEEDED"
+    shutil.rmtree(env.state_dir / "control")
+    old = {pk(r, "schedules"): r for r in source_rows(env.batch_dir, "schedules")}
+    write_batch_source(env.batch_dir, service_days=7, profile="default", overrides={"fleet_changes": {"relief_pool_size": 5}})
+    stale = [r for r in source_rows(env.batch_dir, "schedules") if pk(r, "schedules") in old and old[pk(r, "schedules")] != r]
+    assert stale and all(old[pk(r, "schedules")]["updated_at"] == r["updated_at"] for r in stale)  # guard
+    runs_before = committed_run_ids(env.bronze_dir)
+    result = env.run(t2)
+    assert result.status == "FAILED"
+    for outcome in result.datasets:
+        assert outcome.status == STATUS_FAILED and outcome.error["type"] == "ControlStateMismatchError", outcome
+        assert "no control record" in outcome.error["message"]
+    assert committed_run_ids(env.bronze_dir) == runs_before
+    assert not (env.state_dir / "control").exists() or not list((env.state_dir / "control").glob("*.json"))
+
+
+def test_initial_window_crash_then_later_as_of_is_refused_with_a_same_as_of_recovery_path(tmp_path, uninterrupted):
     env = make_env(tmp_path)
     first, second = _cuts(env)
     with pytest.raises(SimulatedCrash):
         env.run(first, hook=crash_hook(STAGE_BRONZE_COMMITTED, TARGET))
     assert env.control(TARGET) is None
     result = env.run(second)
-    outcome = result.dataset(TARGET)
-    assert result.status == "SUCCEEDED" and outcome.status == STATUS_COMMITTED
-    audit = env.audit_records(result.pipeline_run_id, TARGET)[0]
-    assert audit["recovered_bronze_run_id"] == f"inc-{TARGET}-initial-{first:%Y%m%dT%H%M%S}Z"
-    # Watermark before the attempt was unset; the new window starts at the adopted window's end.
-    assert audit["watermark_before"] is None and audit["window_low"] == format_ts(first)
-    (_, expected_control), expected_count = uninterrupted[1]
-    assert bronze_record_count(env.bronze_dir) == expected_count  # nothing landed twice
-    for dataset in INCREMENTAL_DATASETS:
-        keys = bronze_keys(env.bronze_dir, dataset)
-        assert keys == expected_keys(env.batch_dir, dataset, second) and max(keys.values()) == 1
-    # TARGET and every dataset before it went through the same two windows as
-    # the uninterrupted run, so their control records are byte-identical.
-    # (Datasets after TARGET never ran at `first`; they loaded one window.)
-    _, control = _snapshot(env)
-    plan = [*REFERENCE_ENTITIES, *INCREMENTAL_DATASETS]
-    for dataset in plan[: plan.index(TARGET) + 1]:
-        assert control[f"{dataset}.json"] == expected_control[f"{dataset}.json"], dataset
+    _refused_without_landing(env, result, "same --as-of")
+    assert env.control(TARGET) is None
+    # Operator recovery: rerun only that dataset with the interrupted as_of
+    # (the others already moved past it), then continue normally.
+    narrow = env.with_config(include_unlisted_catalogue_datasets=False, datasets=[{"name": TARGET, "mode": "incremental"}])
+    assert narrow.run(first).dataset(TARGET).status == STATUS_ALREADY_COMMITTED
+    assert env.run(second).dataset(TARGET).status == STATUS_COMMITTED
+    (expected_records, _), expected_count = uninterrupted[1]
+    assert bronze_record_count(env.bronze_dir) == expected_count
+    assert bronze_records(env.bronze_dir, TARGET) == expected_records[TARGET]
 
 
 def test_unrecorded_run_whose_extract_disagrees_with_bronze_is_refused(tmp_path):
-    env = make_env(tmp_path)
-    first, second = _cuts(env)
-    with pytest.raises(SimulatedCrash):
-        env.run(first, hook=crash_hook(STAGE_BRONZE_COMMITTED, TARGET))
-    extract = next((env.state_dir / "extracts" / TARGET).glob("*/historical_trips.jsonl"))
+    env, _first, second, third = _crash_in_second_window(tmp_path)
+    control_before = env.control(TARGET)
+    run_id = bronze_run_id_for(env.config, _plan(env), parse_ts(control_before["watermark"]), second)
+    extract = env.state_dir / "extracts" / TARGET / run_id / f"{TARGET}.jsonl"
     extract.write_bytes(extract.read_bytes() + b"{}\n")
     count_after_crash = bronze_record_count(env.bronze_dir)
-    result = env.run(second)
-    outcome = result.dataset(TARGET)
-    assert outcome.status == STATUS_FAILED and outcome.error["type"] == "ControlStateMismatchError"
-    assert "does not match its extract" in outcome.error["message"]
+    result = env.run(third)
+    _refused_without_landing(env, result, "does not match its extract")
     landed_by_others = sum(
         r.extracted_count or 0 for r in result.datasets if r.dataset != TARGET and r.status == STATUS_COMMITTED
     )
     assert bronze_record_count(env.bronze_dir) == count_after_crash + landed_by_others  # nothing extra for TARGET
-    assert env.control(TARGET) is None
+    assert env.control(TARGET) == control_before
 
 
 def test_unrecorded_run_without_its_extract_is_refused_with_guidance(tmp_path):
-    env = make_env(tmp_path)
-    first, second = _cuts(env)
-    with pytest.raises(SimulatedCrash):
-        env.run(first, hook=crash_hook(STAGE_BRONZE_COMMITTED, TARGET))
+    env, _first, second, third = _crash_in_second_window(tmp_path)
+    control_before = env.control(TARGET)
     shutil.rmtree(env.state_dir / "extracts" / TARGET)
-    result = env.run(second)
-    outcome = result.dataset(TARGET)
-    assert outcome.error["type"] == "ControlStateMismatchError"
-    assert "same --as-of" in outcome.error["message"]
-    assert env.control(TARGET) is None
-    # The guidance works while the other datasets have not moved past `first`
-    # ... here they have, so the whole-pipeline rerun at `first` is refused:
-    with pytest.raises(AsOfError, match="earlier than the current watermark"):
-        env.run(first)
+    result = env.run(third)
+    _refused_without_landing(env, result, "same --as-of")
+    assert env.control(TARGET) == control_before
+    # The other datasets have moved past `second`, so the whole-pipeline
+    # rerun at `second` is refused; the single-dataset rerun recovers.
+    with pytest.raises(AsOfError, match="earlier than the last committed as_of"):
+        env.run(second)
+    narrow = env.with_config(include_unlisted_catalogue_datasets=False, datasets=[{"name": TARGET, "mode": "incremental"}])
+    assert narrow.run(second).dataset(TARGET).status == STATUS_ALREADY_COMMITTED
+    assert env.run(third).status == "SUCCEEDED"
+    assert_bronze_matches_source(env.bronze_dir, env.batch_dir, third)
 
 
 def test_recovery_path_with_same_as_of_then_next_window(tmp_path, uninterrupted):
@@ -212,13 +316,22 @@ def test_recovery_path_with_same_as_of_then_next_window(tmp_path, uninterrupted)
     assert _snapshot(env) == (expected_records, expected_control)
 
 
-def test_lost_control_record_after_one_window_is_rebuilt_without_duplicates(tmp_path):
+def test_lost_control_record_after_one_window_is_refused_then_rebuilt_by_the_same_as_of(tmp_path):
     env = make_env(tmp_path)
     first, second = _cuts(env)
     env.run(first)
+    expected_control = env.control(TARGET)
     (env.state_dir / "control" / f"{TARGET}.json").unlink()
+    runs_before = committed_run_ids(env.bronze_dir)
     result = env.run(second)
-    assert result.dataset(TARGET).status == STATUS_COMMITTED
+    _refused_without_landing(env, result, "no control record")
+    assert [r for r in committed_run_ids(env.bronze_dir) if r.startswith(f"inc-{TARGET}-")] == [
+        r for r in runs_before if r.startswith(f"inc-{TARGET}-")
+    ]
+    narrow = env.with_config(include_unlisted_catalogue_datasets=False, datasets=[{"name": TARGET, "mode": "incremental"}])
+    assert narrow.run(first).dataset(TARGET).status == STATUS_ALREADY_COMMITTED
+    assert env.control(TARGET) == expected_control
+    assert env.run(second).dataset(TARGET).status == STATUS_COMMITTED
     keys = bronze_keys(env.bronze_dir, TARGET)
     assert keys == expected_keys(env.batch_dir, TARGET, second) and max(keys.values()) == 1
 
@@ -244,4 +357,4 @@ def test_recorded_run_missing_from_bronze_is_detected(tmp_path):
     (env.bronze_dir / "_runs" / f"{run_id}.json").unlink()
     result = env.run(second)
     assert result.dataset(TARGET).error["type"] == "ControlStateMismatchError"
-    assert env.control(TARGET)["watermark"] != result.as_of
+    assert env.control(TARGET)["last_as_of"] == format_ts(first)

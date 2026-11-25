@@ -107,9 +107,10 @@ def test_guard_sequences_include_cuts_equal_to_values_and_empty_windows(tmp_path
 
 def test_no_loss_no_duplicates_when_the_source_grows_between_runs(tmp_path):
     """DE-04 is prefix-stable in `service_days`; the source is regenerated in
-    place with an otherwise identical config. A cut is valid for a source
-    only up to its completeness horizon (the earliest `updated_at` the next
-    regeneration adds - DE-04 publishes timetables days ahead)."""
+    place with an otherwise identical config. This variant cuts below the
+    cross-dataset horizon (the earliest `updated_at` the regeneration adds);
+    cuts past it - the realistic case QA showed 9a7eac2 losing rows on - are
+    covered by `test_incremental_watermark.py`."""
     env = make_env(tmp_path, service_days=1)
     small = {d: source_rows(env.batch_dir, d) for d in INCREMENTAL_DATASETS}
     probe = tmp_path / "probe"
@@ -140,5 +141,9 @@ def test_no_loss_no_duplicates_when_the_source_grows_between_runs(tmp_path):
         assert result.status == "SUCCEEDED", [(r.dataset, r.error) for r in result.datasets if r.error]
         for dataset in INCREMENTAL_DATASETS:
             audit = env.audit_records(result.pipeline_run_id, dataset)[-1]
-            assert audit["late_arrival_check"]["holds"] is True  # no false positive
+            check = audit["late_arrival_check"]
+            if audit["watermark_before"] is None:  # nothing committed yet: nothing to recount
+                assert check is None
+            else:
+                assert check["holds"] is True  # no false positive
         _assert_no_loss_no_duplicates(env, cut)

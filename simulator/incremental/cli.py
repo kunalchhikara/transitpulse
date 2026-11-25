@@ -7,16 +7,21 @@ Usage:
     python -m simulator.incremental --as-of 2025-01-07T00:00:00Z --fixed-clock 2025-02-01T00:00:00Z
 
 `--as-of` (required, ISO-8601 with a UTC offset) is the extraction time: each
-incremental dataset loads `watermark < updated_at <= as_of` (everything up to
-`as_of` on its first load); reference entities are reloaded in full and
-skipped when unchanged. One JSON summary line goes to stdout; structured
-JSON-lines logs (every line carries `pipeline_run_id`) go to stderr or
-`--log-file` (appended to - the run id tells runs apart).
+incremental dataset loads `watermark < updated_at <= as_of`, where the
+watermark is the maximum `updated_at` already committed for that dataset
+(everything up to `as_of` until a row is committed); reference entities are
+reloaded in full and skipped when unchanged. One JSON summary line goes to
+stdout; structured JSON-lines logs (every line carries `pipeline_run_id`) go
+to stderr or `--log-file` (appended to - the run id tells runs apart).
 
 Exit codes: 0 every dataset succeeded (incl. SKIPPED_UNCHANGED/UP_TO_DATE);
 1 PARTIAL or FAILED (see the audit records; failed watermarks unchanged);
-2 refused before anything was written (bad/regressing `--as-of`, invalid
-config, reused `--pipeline-run-id`).
+2 refused before anything was written (bad `--as-of` or one earlier than a
+dataset's last committed as_of, invalid config, reused `--pipeline-run-id`,
+a control record of another schema version);
+3 SUCCEEDED_WITH_WARNINGS: every dataset succeeded but late rows were
+skipped (or source rows vanished) under `--late-arrival-policy record` -
+see `late_rows_skipped` / `warnings`.
 """
 
 from __future__ import annotations
@@ -39,7 +44,10 @@ from simulator.incremental.config import (
 from simulator.incremental.loader import (
     BRONZE_LOGGER_NAME,
     LOGGER_NAME,
+    PIPELINE_FAILED,
+    PIPELINE_PARTIAL,
     PIPELINE_SUCCEEDED,
+    PIPELINE_SUCCEEDED_WITH_WARNINGS,
     AsOfError,
     run_incremental_load,
 )
@@ -150,12 +158,16 @@ def main(argv: list[str] | None = None) -> int:
                 "pipeline_run_id": result.pipeline_run_id,
                 "as_of": result.as_of,
                 "summary": result.summary_path,
+                "late_rows_skipped": result.late_rows_skipped,
+                "warnings": result.warnings,
                 "datasets": {
                     r.dataset: {
                         "status": r.status,
                         "attempts": r.attempts,
                         "watermark_after": r.watermark_after,
+                        "last_as_of_after": r.last_as_of_after,
                         "extracted_count": r.extracted_count,
+                        "late_rows_skipped": r.late_rows_skipped,
                         "error_type": r.error["type"] if r.error else None,
                     }
                     for r in result.datasets
@@ -164,7 +176,11 @@ def main(argv: list[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    return 0 if result.status == PIPELINE_SUCCEEDED else 1
+    return EXIT_CODES.get(result.status, 1)
+
+
+#: Process exit code per pipeline status (2 = refused, see `main`).
+EXIT_CODES = {PIPELINE_SUCCEEDED: 0, PIPELINE_SUCCEEDED_WITH_WARNINGS: 3, PIPELINE_PARTIAL: 1, PIPELINE_FAILED: 1}
 
 
 if __name__ == "__main__":  # pragma: no cover

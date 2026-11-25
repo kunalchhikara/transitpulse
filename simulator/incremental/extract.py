@@ -49,6 +49,23 @@ BAD_REASONS: tuple[str, ...] = (
     BAD_INVALID_WATERMARK,
     BAD_MISSING_SCHEMA_VERSION,
 )
+#: What Bronze (DE-05) makes of a bad line landed under the preserve policy.
+#: Not UTF-8 / not JSON / duplicate keys / not an object -> a Bronze
+#: parse-error record. A JSON object whose watermark is missing or invalid
+#: (or a reference element without `schema_version`) is a well-formed
+#: object to Bronze, so it is stored as a NORMAL record: DE-12 must
+#: quarantine it (Lead decision D2), which is why every such row is listed.
+BRONZE_PARSE_ERROR_RECORD = "bronze_parse_error_record"
+STORED_RECORD_REQUIRES_QUARANTINE = "stored_record_requires_quarantine"
+BRONZE_OUTCOME_BY_REASON: dict[str, str] = {
+    BAD_INVALID_UTF8: BRONZE_PARSE_ERROR_RECORD,
+    BAD_INVALID_JSON: BRONZE_PARSE_ERROR_RECORD,
+    BAD_DUPLICATE_KEY: BRONZE_PARSE_ERROR_RECORD,
+    BAD_NOT_OBJECT: BRONZE_PARSE_ERROR_RECORD,
+    BAD_MISSING_WATERMARK: STORED_RECORD_REQUIRES_QUARANTINE,
+    BAD_INVALID_WATERMARK: STORED_RECORD_REQUIRES_QUARANTINE,
+    BAD_MISSING_SCHEMA_VERSION: STORED_RECORD_REQUIRES_QUARANTINE,
+}
 
 
 class SourceError(Exception):
@@ -107,10 +124,15 @@ class Selection:
     bad_preserved: int = 0  # bad lines landed by this extract (preserve policy)
     below_or_at_low: int = 0  # good rows with watermark <= low (already loaded)
     after_high: int = 0  # good rows with watermark > high (later windows)
+    max_watermark: datetime | None = None  # max watermark of the selected good rows
 
     @property
     def count(self) -> int:
         return len(self.lines)
+
+    @property
+    def good_lines(self) -> list[SourceLine]:
+        return [line for line in self.lines if not line.is_bad]
 
 
 @dataclass(frozen=True)
@@ -306,6 +328,8 @@ def select_window(
         else:
             selection.lines.append(line)
             selection.in_window += 1
+            if selection.max_watermark is None or line.watermark > selection.max_watermark:
+                selection.max_watermark = line.watermark
     return selection
 
 
@@ -329,6 +353,25 @@ def count_at_or_below(snapshot: SourceSnapshot, watermark: datetime) -> int:
 def extract_bytes(lines: Sequence[SourceLine]) -> bytes:
     """Extract file content: each selected line's exact bytes + `\\n`."""
     return b"".join(line.raw + b"\n" for line in lines)
+
+
+def preserved_bad_rows(lines: Sequence[SourceLine]) -> list[dict[str, Any]]:
+    """Deterministic listing of the bad lines an extract carries (preserve
+    policy), in extract order: 1-based line number within the extract, line
+    number in the source (element index for a reference file), reason,
+    sha256 of the exact line bytes, and what Bronze makes of it. Written to
+    both the extract manifest and the attempt's audit record (Lead D2)."""
+    return [
+        {
+            "extract_line": number,
+            "source_line": line.line_number,
+            "reason": line.bad_reason,
+            "sha256": line.sha256,
+            "bronze_outcome": BRONZE_OUTCOME_BY_REASON[line.bad_reason],  # type: ignore[index]
+        }
+        for number, line in enumerate(lines, start=1)
+        if line.is_bad
+    ]
 
 
 # -- writing -----------------------------------------------------------------
@@ -372,6 +415,7 @@ def write_extract(
                 "partition_column": plan.partition_column,
                 "min_watermark": format_ts(watermarks[0]) if watermarks else None,
                 "max_watermark": format_ts(watermarks[-1]) if watermarks else None,
+                "preserved_bad_rows": preserved_bad_rows(lines),
             }
         },
     }
