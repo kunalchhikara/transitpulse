@@ -868,7 +868,9 @@ Transfer model (`simulator/batch/fleet.py`, config `[fleet_changes]`):
 writing local files. No Fabric Lakehouse, OneLake, Eventstream or any other
 Azure/Fabric resource has been created, read or written; nothing here is
 evidence of Fabric execution. See "Mapping to a future Fabric Bronze
-notebook" below for how it is meant to carry over.
+notebook" below for how it is meant to carry over. DE-09 (failed-attempt
+audit trail and path-free manifests, BACKLOG FU-03/FU-04) extends this
+section and is likewise **IMPLEMENTED - NOT CONNECTED**.
 
 Bronze (PROJECT.md section 8, ADR-0002) keeps the source representation with
 minimum transformation plus ingestion metadata, so any later layer can be
@@ -1001,7 +1003,7 @@ newline (a typical truncated write) is additionally flagged per file as
 |---|---|
 | Same `run_id`, same input, run committed | No-op: returns `ALREADY_COMMITTED`, writes nothing - output stays byte-identical even under a different clock. |
 | Same `run_id`, different input, run committed | Refused: `RunIdConflictError`. A committed run is never overwritten. |
-| Same `run_id`, previous attempt `FAILED` or crashed | Retried from scratch (orphans removed first). |
+| Same `run_id`, previous attempt `FAILED` or crashed | Retried from scratch (orphans removed first, listed in `removed_uncommitted_paths`). Every earlier `FAILED` attempt is kept in `previous_attempts` (DE-09, see below). |
 | New `run_id`, an input file whose exact content (sha256) a committed run already ingested into the same table | Refused: `DuplicateInputError` (a `FAILED` manifest records the refusal). Renaming the file does not help - detection is by content. |
 | ...the same, with `--allow-replay` | Committed and flagged: manifest `replay_of` lists the prior run ids. The copies stay distinguishable by `run_id`/`ingestion_time`; Silver's `event_id`/primary-key dedup removes them downstream. |
 | The same content given twice within one run (e.g. a file and its copy) | Refused: `DuplicateInputError`; with `--allow-replay` committed and flagged in `duplicate_input_files`. |
@@ -1017,14 +1019,54 @@ in-process or across separate processes (`--fixed-ingestion-time`).
 ### Run manifest and accounting identity
 
 `_runs/<run_id>.json` (sorted keys; every time field comes from the injected clock) records:
-`run_id`, `status` (`COMMITTED`/`FAILED`), `mode`, run-level `source`,
+`bronze_manifest_version`, `run_id`, `status` (`COMMITTED`/`FAILED`), `mode`, run-level `source`,
 `ingestion_time`, `started_at`, `ended_at`, `duration_seconds`,
 `parse_error_policy`, `allow_replay`, `replay_of`, `duplicate_input_files`, `input_fingerprint`,
-`input_files` (per file: name, path as given, table, source, sha256, size and
+`previous_attempts`, `input_path_policy`,
+`input_files` (per file: name, path (see path policy), table, source, sha256, size and
 all counters, `parse_errors_by_code`, `unterminated_final_line`, and for batch
 `source_manifest_check`), `tables` (per table: committed path, sha256 of the
 data file, counters), `totals`, `ignored_files`, `removed_uncommitted_paths`,
 `source_reconciliation` and `error`.
+
+**Failed-attempt audit trail (DE-09, BACKLOG FU-03).** Retrying a `FAILED`
+run_id no longer loses the earlier error: the new attempt's manifest carries
+`previous_attempts`, one entry per earlier `FAILED` attempt, oldest first -
+the same list Silver (DE-06) and Gold (DE-07) keep, with the keys they record
+(`started_at`, `ended_at`, `input_fingerprint`, `error`) plus `status`,
+`duration_seconds` and `totals` (the attempt's counters; `null` when it failed
+before counting finished, e.g. a refused duplicate input). Two failures then a
+success leave exactly two entries; an `ALREADY_COMMITTED` no-op writes nothing
+and so adds nothing; a first-time commit has `[]`. A *crashed* attempt (killed
+before it could write a manifest) cannot be listed - its leftovers show up in
+`removed_uncommitted_paths` of the next attempt instead.
+
+**Path policy (DE-09, BACKLOG FU-04).** A manifest never records a local
+absolute path, so it can be published as RECORDED evidence as-is:
+
+| Field | Recorded as |
+|---|---|
+| `input_files[].path` | Relative to the file's input directory, i.e. the **basename** (`-` for stdin), whatever form the path was given in (absolute or relative). Declared in the manifest as `input_path_policy: "basename"`. Input directories are not recorded; inputs are identified by name + `sha256` + `size_bytes`. |
+| `tables[].path`, `removed_uncommitted_paths` | Relative to the Bronze store root (unchanged). The store root itself is not recorded. |
+| `source_reconciliation.source_manifest` | The DE-04 manifest's file name (unchanged). |
+| `error.message` (incl. inside `previous_attempts`) | Exception text with the store root replaced by `<bronze_root>`, input directories by `<input_dir>` and the home directory by `~`. Each root is matched as given (including a relative spelling, since OS errors quote paths exactly as passed), absolute and symlink-resolved, only at path-component boundaries. The exception raised to the caller keeps the full text. |
+
+Consequently the same input content + run_id + fixed clock gives a
+byte-identical manifest wherever the input lives (tested across two CLI
+processes reading from different absolute directories). The structured log
+line "bronze run committed" also records the manifest store-relatively
+(`_runs/<run_id>.json`); the CLI's stdout summary still prints the manifest's
+location as a local path, because it is an operator pointer, not a persisted
+artifact.
+
+**Manifest version and compatibility.** `bronze_manifest_version` is `1.1.0`
+since DE-09 (adds `previous_attempts` and `input_path_policy`; `path` is now a
+basename). DE-09 only *adds* fields: `1.0.0` manifests written before it
+(no `previous_attempts`, absolute `input_files[].path`) are still read by
+`BronzeStore`, the same-run_id no-op / conflict checks, the replay guard, a
+retry over a legacy `FAILED` manifest (whose attempt becomes the first
+`previous_attempts` entry), and by Silver and Gold - fixture-tested in
+`test_bronze_legacy_manifest.py`. Existing legacy manifests are not rewritten.
 
 Accounting identity, checked per input file, per table and in total before
 commit (and the line count of each staged data file is re-read and compared):
@@ -1098,6 +1140,8 @@ over unchanged:
 | Same-run_id no-op | Delta idempotent writes (`txnAppId`/`txnVersion` writer options) or a pre-check against the run-audit table. |
 | Duplicate-input guard (file sha256) | A processed-files control table checked before load. |
 | `_runs/<run_id>.json` | A `bronze_run_audit` Delta table (PROJECT.md section 15 batch metrics). |
+| `previous_attempts` (DE-09) | One `bronze_run_audit` row per attempt (append-only, so no history is overwritten) instead of a nested list. |
+| Basename-only `input_files[].path` (DE-09) | Record `_metadata.file_name` / a path relative to the Lakehouse `Files/` landing folder, never a workstation path. |
 | `stream` mode over a bounded file/stdin | Eventstream -> Lakehouse destination, or Structured Streaming with a checkpoint where the micro-batch `batchId` plays the role of `run_id`. |
 
 ### DE-05 tests
@@ -1133,6 +1177,24 @@ over unchanged:
   into `python -m simulator.bronze stream --input -`; batch rerun/duplicate/
   replay exit codes; `--strict`; missing input; run-id conflict; config
   validation.
+- `test_bronze_retry_history.py` (DE-09) - two failures then a success keep
+  exactly two `previous_attempts` entries, each equal to the FAILED manifest
+  read back from disk before the retry (stream: strict parse failure + I/O
+  failure during commit; batch: two source-manifest mismatches; CLI: strict +
+  duplicate-input failures); `ALREADY_COMMITTED` adds nothing; refused
+  attempts have `totals: null`; a crash after a failure; accounting identities
+  and data files equal a never-failed run.
+- `test_bronze_path_policy.py` (DE-09) - with absolute inputs (and `HOME`
+  pointed at the test directory), no string anywhere in a COMMITTED or FAILED
+  manifest starts with `/` or contains the home directory, input or output
+  roots or the repository path; library and CLI, stream and batch; error
+  messages carrying absolute paths are redacted; manifests from two different
+  absolute input locations are byte-identical.
+- `test_bronze_legacy_manifest.py` (DE-09) - pre-DE-09 manifests (a verbatim
+  `1.0.0` FAILED fixture, and committed manifests rewritten to the exact
+  `1.0.0` key sets) are accepted by `BronzeStore`, the no-op/replay guards, a
+  retry, and by Silver and Gold, whose output is byte-identical to the same
+  pipeline over a `1.1.0` manifest.
 
 ### Known limitations (DE-05)
 
@@ -1149,8 +1211,14 @@ over unchanged:
   selection is applied in Bronze - the watermark/incremental engine
   (PROJECT.md section 11) is later scope.
 - **Blank lines are counted, not stored** (they carry no payload).
-- Run order in `read_table` is by (`ingestion_time`, `run_id`); manifests
-  record input paths as given on the command line.
+- Run order in `read_table` is by (`ingestion_time`, `run_id`).
+- **Path redaction in error text covers known roots only** (store root, input
+  directories, home directory). An absolute path outside all of them inside
+  an exception message (none is produced by Bronze's own errors) would be
+  kept. Manifests written before DE-09 keep their as-given paths; they are
+  read, never rewritten - sanitise them before publishing.
+- **Crashed attempts are not in `previous_attempts`** (no manifest was
+  written); only their leftovers are recorded via `removed_uncommitted_paths`.
 - No retention/compaction of old run partitions.
 
 ## DE-06: Local Silver Layer (telemetry stream)

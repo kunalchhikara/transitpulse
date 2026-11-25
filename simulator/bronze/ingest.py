@@ -15,13 +15,20 @@ Idempotency / replay policy (see README "DE-05" for the full table):
 * same `run_id`, different input, already committed -> `RunIdConflictError`;
   a committed run is never overwritten.
 * same `run_id`, previous attempt FAILED / crashed -> retried from scratch
-  (orphaned staging/partitions removed first).
+  (orphaned staging/partitions removed first); every earlier FAILED attempt
+  is kept in the manifest's `previous_attempts` (DE-09, BACKLOG FU-03).
 * new `run_id`, an input file already ingested by a committed run ->
   `DuplicateInputError`, unless `allow_replay=True`, in which case the run is
   committed and flagged (`replay_of`) in its manifest.
 * the same content twice within one run -> `DuplicateInputError`, unless
   `allow_replay=True` (flagged in `duplicate_input_files`).
 * new `run_id`, new input -> appended as a new run partition.
+
+Path policy (DE-09, BACKLOG FU-04): manifests never record local absolute
+paths. `input_files[].path` is the file name relative to its input directory
+(the basename; `-` for stdin), declared as `input_path_policy`; store paths
+are relative to the Bronze root; absolute store/input roots and the home
+directory are replaced by placeholders in persisted error messages.
 """
 
 from __future__ import annotations
@@ -29,6 +36,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -56,7 +65,21 @@ from simulator.bronze.store import (
 )
 
 LOGGER_NAME = "simulator.bronze"
-BRONZE_MANIFEST_VERSION = "1.0.0"
+#: 1.1.0 (DE-09): adds `previous_attempts` and `input_path_policy`;
+#: `input_files[].path` is the basename. 1.0.0 manifests remain readable.
+BRONZE_MANIFEST_VERSION = "1.1.0"
+#: `input_files[].path` is relative to the file's input directory, i.e. its
+#: basename (`-` for stdin). Directory locations are never recorded.
+INPUT_PATH_POLICY = "basename"
+#: Fields copied from a FAILED manifest into the retry's `previous_attempts`:
+#: the keys Silver/Gold record, plus status, duration and counts (`totals` is
+#: null when the attempt failed before counting finished).
+PREVIOUS_ATTEMPT_KEYS = (
+    "status", "started_at", "ended_at", "duration_seconds", "input_fingerprint", "error", "totals",
+)
+BRONZE_ROOT_PLACEHOLDER = "<bronze_root>"
+INPUT_DIR_PLACEHOLDER = "<input_dir>"
+HOME_PLACEHOLDER = "~"
 STATUS_ALREADY_COMMITTED = "ALREADY_COMMITTED"
 STDIN_NAME = "<stdin>"
 MODE_STREAM = "stream"
@@ -130,7 +153,9 @@ class AccountingError(BronzeError):
 @dataclass(frozen=True)
 class SourceFile:
     """One input file, fully read. `name` (basename) is stamped into records
-    as lineage; `path` (as given) is recorded in the manifest only."""
+    as lineage; `path` (as given) is used only to locate the file and to
+    redact its directory from persisted error messages - the manifest records
+    `manifest_input_path(path)`, never the path as given."""
 
     table: str
     source: str
@@ -216,6 +241,87 @@ def _get_logger(logger: logging.Logger | None) -> logging.Logger:
     return logger if logger is not None else logging.getLogger(LOGGER_NAME)
 
 
+# -- path policy (DE-09 / FU-04) ---------------------------------------------
+
+
+def manifest_input_path(path_as_given: str) -> str:
+    """The manifest form of an input path: relative to its input directory,
+    i.e. the basename (either separator style); `-` (stdin) unchanged."""
+    if path_as_given == "-":
+        return path_as_given
+    return re.split(r"[\\/]", path_as_given.rstrip("\\/"))[-1]
+
+
+def _home_dir() -> str | None:
+    try:
+        return str(Path.home())
+    except (RuntimeError, KeyError):  # no HOME and no passwd entry
+        return None
+
+
+class PathRedactor:
+    """Replaces known absolute local roots inside free text (exception
+    messages) with placeholders before the text is persisted: the Bronze
+    store root -> `<bronze_root>`, input directories -> `<input_dir>`, the
+    home directory -> `~`. Each root is matched as given (including a
+    relative spelling such as the default `simulator/_out/bronze`, since OS
+    errors quote paths exactly as passed), absolute and resolved (e.g. macOS
+    `/var` -> `/private/var`), longest first, and only at path-component
+    boundaries (a relative form must also start at a boundary, so `out` never
+    matches inside `timeout/`)."""
+
+    def __init__(self, store_root: Path, input_dirs: Sequence[Path] = ()) -> None:
+        forms: dict[str, str] = {}
+
+        def add(path: Path | str | None, label: str) -> None:
+            if path is None:
+                return
+            candidates = {str(path)}
+            if isinstance(path, Path):
+                candidates |= {str(path.absolute()), str(path.resolve())}
+            for form in candidates:
+                form = form.rstrip("\\/")
+                if form and form not in {".", ".."}:
+                    forms.setdefault(form, label)
+
+        for directory in input_dirs:
+            add(directory, INPUT_DIR_PLACEHOLDER)
+        add(store_root, BRONZE_ROOT_PLACEHOLDER)
+        add(_home_dir(), HOME_PLACEHOLDER)
+
+        def pattern(form: str) -> re.Pattern[str]:
+            left = "" if os.path.isabs(form) else r"(?<![\w.~/\\-])"
+            return re.compile(left + re.escape(form) + r"(?![\w.-])")
+
+        self._rules = [
+            (pattern(form), label)
+            for form, label in sorted(forms.items(), key=lambda item: len(item[0]), reverse=True)
+        ]
+
+    def __call__(self, text: str) -> str:
+        for pattern, label in self._rules:
+            text = pattern.sub(label, text)
+        return text
+
+    def error(self, error: Any) -> Any:
+        """A manifest `error` object with its message redacted."""
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            return {**error, "message": self(error["message"])}
+        return error
+
+
+def _previous_attempts(existing: dict[str, Any], redact: PathRedactor) -> list[dict[str, Any]]:
+    """`previous_attempts` for a retry of the FAILED run in `existing`: the
+    attempts it already listed, then the FAILED attempt itself. A manifest
+    written before DE-09 has no list; its own attempt is still recorded."""
+    carried = existing.get("previous_attempts")
+    history = [dict(entry) for entry in carried if isinstance(entry, dict)] if isinstance(carried, list) else []
+    history.append({key: existing.get(key) for key in PREVIOUS_ATTEMPT_KEYS})
+    for entry in history:
+        entry["error"] = redact.error(entry.get("error"))
+    return history
+
+
 # -- core run ----------------------------------------------------------------
 
 
@@ -237,17 +343,21 @@ def _run(
     store = BronzeStore(output_dir)
     fingerprint = _fingerprint(mode, inputs)
     log_ctx = {"run_id": run_id, "mode": mode, "source": run_source}
+    redact = PathRedactor(output_dir, [Path(s.path).parent for s in inputs if s.path != "-"])
 
     existing = store.read_manifest(run_id)
-    if existing is not None and existing.get("status") == STATUS_COMMITTED:
-        if existing.get("input_fingerprint") == fingerprint:
-            logger.info("run already committed with identical input; no-op", extra=log_ctx)
-            return RunResult(STATUS_ALREADY_COMMITTED, run_id, existing, store.manifest_path(run_id))
-        raise RunIdConflictError(
-            f"run_id {run_id!r} is already committed with different input "
-            f"(committed fingerprint {existing.get('input_fingerprint')}, new {fingerprint}); "
-            "committed runs are never overwritten - use a new run_id"
-        )
+    previous_attempts: list[dict[str, Any]] = []
+    if existing is not None:
+        if existing.get("status") == STATUS_COMMITTED:
+            if existing.get("input_fingerprint") == fingerprint:
+                logger.info("run already committed with identical input; no-op", extra=log_ctx)
+                return RunResult(STATUS_ALREADY_COMMITTED, run_id, existing, store.manifest_path(run_id))
+            raise RunIdConflictError(
+                f"run_id {run_id!r} is already committed with different input "
+                f"(committed fingerprint {existing.get('input_fingerprint')}, new {fingerprint}); "
+                "committed runs are never overwritten - use a new run_id"
+            )
+        previous_attempts = _previous_attempts(existing, redact)
 
     started = _require_aware(clock())
     ingestion_time = format_timestamp(started)
@@ -267,8 +377,10 @@ def _run(
         "replay_of": [],
         "duplicate_input_files": [],
         "input_fingerprint": fingerprint,
+        "previous_attempts": previous_attempts,
+        "input_path_policy": INPUT_PATH_POLICY,
         "input_files": [
-            {"index": i, "file": s.name, "path": s.path, "table": s.table, "source": s.source,
+            {"index": i, "file": s.name, "path": manifest_input_path(s.path), "table": s.table, "source": s.source,
              "sha256": s.sha256, "size_bytes": len(s.data)}
             for i, s in enumerate(inputs)
         ],
@@ -397,6 +509,11 @@ def _run(
             for fh in handles.values():
                 fh.close()
 
+        # Counting is complete here; record it before any check that can fail,
+        # so a FAILED attempt (e.g. a source-manifest mismatch) keeps its counts.
+        totals = _sum_counters([s.counters() for s in file_stats])
+        manifest["totals"] = totals
+
         # Source reconciliation against the DE-04 manifest (batch only).
         if source_manifest is None:
             reconciliation = {"status": "NOT_APPLICABLE" if mode == MODE_STREAM else "NO_SOURCE_MANIFEST"}
@@ -434,8 +551,6 @@ def _run(
                 "input_files": [inputs[i].name for i in indexes],
                 **counters,
             }
-        totals = _sum_counters([s.counters() for s in file_stats])
-        manifest["totals"] = totals
         manifest["accounting_identity_holds"] = accounting_identity_holds(totals) and all(
             accounting_identity_holds(s.counters()) for s in file_stats
         )
@@ -463,14 +578,15 @@ def _run(
         manifest["status"] = STATUS_FAILED
         manifest["ended_at"] = format_timestamp(ended)
         manifest["duration_seconds"] = (ended - started).total_seconds()
-        manifest["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        manifest["error"] = {"type": type(exc).__name__, "message": redact(str(exc))}
         store.write_manifest(manifest)
         logger.error("bronze run failed; nothing committed", extra={**log_ctx, "error": manifest["error"]})
         raise
 
     logger.info(
         "bronze run committed",
-        extra={**log_ctx, "manifest": str(path), "replay_of": manifest["replay_of"], **manifest["totals"]},
+        extra={**log_ctx, "manifest": path.relative_to(store.root).as_posix(), "replay_of": manifest["replay_of"],
+               **manifest["totals"]},
     )
     return RunResult(STATUS_COMMITTED, run_id, manifest, path)
 
