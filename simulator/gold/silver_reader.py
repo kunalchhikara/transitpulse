@@ -27,7 +27,12 @@ from simulator.bronze.store import RUNS_DIR_NAME, STATUS_COMMITTED, validate_run
 from simulator.gold.errors import GoldInputError
 
 SILVER_LAYER = "silver"
-SUPPORTED_SILVER_MANIFEST_VERSIONS = frozenset({"1.0.0"})
+#: Versions whose STRUCTURE Gold can check (every committed manifest in the
+#: store is checked - fail closed). Aggregating a run additionally needs the
+#: DE-08 event-time settings of 1.1.0 (`aggregate.EventTimeCheck`), so a
+#: pre-DE-08 (1.0.0) run in the store does not block Gold, but is refused,
+#: with a "re-run Silver" message, if it is the run selected.
+SUPPORTED_SILVER_MANIFEST_VERSIONS = frozenset({"1.0.0", "1.1.0"})
 
 ROLE_CLEAN = "clean"
 ROLE_QUARANTINE = "quarantine"
@@ -87,6 +92,10 @@ class SilverRun:
                     "extracted", "valid_loaded", "quarantined", "duplicates_excluded",
                     "in_order", "out_of_order", "late", "quality_percentage",
                 )
+            }
+            | {
+                # DE-08 (silver_manifest_version 1.1.0); absent in older runs.
+                key: self.counters[key] for key in ("watermark_guarded",) if key in self.counters
             },
         }
 

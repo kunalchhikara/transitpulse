@@ -38,21 +38,43 @@ future_time_reference = "generated_at"
 # still counted in the manifest and written to the quarantine table).
 max_logged_rejections = 100
 
-# DE-08 / BACKLOG FU-06: watermark guard. One valid-looking event whose
-# event_time AND generated_at are far in the future passes the future-time
-# tolerance (measured against its own generated_at) and used to move the
-# watermark, flagging nearly every later event late. The guard measures
-# event_time against the record's ARRIVAL instead: an event cannot have been
-# observed more than max_skew_seconds after it arrived.
+# DE-08 / BACKLOG FU-06: STREAM-relative watermark guard. One valid-looking
+# event whose event_time AND generated_at are in the future passes the
+# future-time tolerance (measured against its own generated_at) and used to
+# move the watermark, flagging nearly every later event late. The guard
+# judges an event only against the stream around it (arrival order), never
+# against a clock: a valid, first-seen event more than max_jump_seconds ahead
+# of the current maximum event_time does NOT advance the watermark when, among
+# the next lookahead_events valid first-seen events, fewer than
+# min_corroborating_vehicles distinct OTHER vehicles are within
+# max_jump_seconds of it (or ahead) and at least min_contradicting_vehicles
+# distinct vehicles are more than max_jump_seconds behind it. See README
+# "Watermark guard".
 [silver.watermark_guard]
-#   "quarantine" - reject under rule watermark_guard (default)
-#   "flag"       - load it with _silver_watermark_guarded = true; it is
-#                  classified but never advances the watermark
-#   "off"        - no guard (pre-DE-08 behaviour)
-mode = "quarantine"
-#   "ingestion_time"  - the Bronze ingestion_time of the record (default:
-#                       recorded in Bronze, so replays are deterministic)
+#   "flag" - load it with _silver_watermark_guarded = true; it is classified
+#            (in_order) but never advances the watermark (default)
+#   "off"  - no guard (pre-DE-08 behaviour)
+mode = "flag"
+# A forward jump larger than this needs to be consistent with the stream that
+# follows it. 15 min: larger than any gap in valid DE-02/03/04 output that
+# is not corroborated (DE-04 history jumps hours between trips/days, and is
+# followed by other vehicles); smaller than the outliers QA reproduced (1 day+).
+max_jump_seconds = 900
+lookahead_events = 100
+min_corroborating_vehicles = 2
+min_contradicting_vehicles = 2
+
+# Optional CLOCK-relative check (opt-in; rule arrival_time_skew): quarantine an
+# event whose event_time is more than max_skew_seconds after its arrival.
+# Only meaningful for a live feed whose producers share the ingestion clock;
+# WRONG for simulated or replayed data (a 2027-simulated stream, or a fixed
+# --fixed-ingestion-time before the data, would be quarantined wholesale), so
+# it is off by default.
+[silver.arrival_time_skew]
+#   "off"        - not evaluated (default)
+#   "quarantine" - reject under rule arrival_time_skew
+mode = "off"
+#   "ingestion_time"  - the Bronze ingestion_time of the record
 #   "processing_time" - this Silver run's processing_time
 reference = "ingestion_time"
-# Allowed clock skew between a producer and the ingesting system.
 max_skew_seconds = 300

@@ -20,6 +20,7 @@ from simulator.silver.rules import (
     threshold_reason_rule,
 )
 from simulator.tests._silver_helpers import (
+    ARRIVAL_TIME_SKEW_ON,
     DELETE,
     PIPELINE_RULE_SETTINGS,
     PROCESSING_TIME,
@@ -96,17 +97,20 @@ NEGATIVE = [
     ("delay_range", {"delay_seconds": -(10**30)}),
     ("timestamp_bounds", {"event_time": "9999-12-31T23:59:59Z", "generated_at": "9999-12-31T23:59:59Z"}),
     ("timestamp_bounds", {"event_time": "0001-01-01T00:00:00Z", "generated_at": "0001-01-01T00:00:00Z"}),
-    ("watermark_guard", {"event_time": "2090-01-01T00:00:00Z", "generated_at": "2090-01-01T00:00:00Z"}),
+    # Opt-in (validated with it switched on); more cases in test_silver_watermark_guard.py.
+    ("arrival_time_skew", {"event_time": "2090-01-01T00:00:00Z", "generated_at": "2090-01-01T00:00:00Z"}),
 ]
 
 #: Rules `run_silver` evaluates only because it passes the DE-01 service area
-#: and the Silver watermark guard to the validator; their cases are validated
-#: the same way (the other cases keep the plain validator, so e.g. the global
-#: (90, 180) coordinate boundary is still tested on its own).
-PIPELINE_ONLY_RULES = frozenset({"service_area", "watermark_guard"})
+#: (and the opt-in arrival_time_skew rule) to the validator; their cases are
+#: validated the same way (the other cases keep the plain validator, so e.g.
+#: the global (90, 180) coordinate boundary is still tested on its own).
+PIPELINE_ONLY_RULES = frozenset({"service_area", "arrival_time_skew"})
 
 
 def _validate_for(rule, payload):
+    if rule == "arrival_time_skew":
+        return validate(payload, **{**PIPELINE_RULE_SETTINGS, "arrival_time_skew": ARRIVAL_TIME_SKEW_ON})
     return validate(payload, **PIPELINE_RULE_SETTINGS) if rule in PIPELINE_ONLY_RULES else validate(payload)
 
 
@@ -140,8 +144,8 @@ POSITIVE = [
     ("delay_range", {"delay_seconds": THRESHOLDS.max_delay_seconds}),
     ("delay_range", {"delay_seconds": THRESHOLDS.min_delay_seconds}),
     ("timestamp_bounds", {"event_time": "2000-01-01T00:00:00Z", "generated_at": "2000-01-01T00:00:00Z"}),
-    # validate() ingests at PROCESSING_TIME (2025-02-01T10:00Z); guard skew 300 s.
-    ("watermark_guard", {"event_time": "2025-02-01T10:05:00Z", "generated_at": "2025-02-01T10:05:00Z"}),
+    # validate() ingests at PROCESSING_TIME (2025-02-01T10:00Z); skew 300 s.
+    ("arrival_time_skew", {"event_time": "2025-02-01T10:05:00Z", "generated_at": "2025-02-01T10:05:00Z"}),
 ]
 
 

@@ -113,13 +113,32 @@ def future_time_reason(event_time: datetime, thresholds: ValidationThresholds, n
     return None
 
 
+#: Decimal places the expanded service-area edges are rounded to (1e-9 deg is
+#: ~0.1 mm): `-34.05 - 0.05` is -34.099999999999994 in binary floating point,
+#: which would reject the documented edge -34.10 despite "edges inclusive".
+SERVICE_AREA_EDGE_DECIMALS = 9
+
+
+def service_area_edges(area: BoundingBox, margin_degrees: float) -> tuple[float, float, float, float]:
+    """(min_lat, max_lat, min_lon, max_lon) of `area` expanded by
+    `margin_degrees`, each rounded to `SERVICE_AREA_EDGE_DECIMALS`."""
+    return tuple(
+        round(value, SERVICE_AREA_EDGE_DECIMALS)
+        for value in (
+            area.min_latitude - margin_degrees,
+            area.max_latitude + margin_degrees,
+            area.min_longitude - margin_degrees,
+            area.max_longitude + margin_degrees,
+        )
+    )
+
+
 def in_service_area(latitude: float, longitude: float, area: BoundingBox, margin_degrees: float) -> bool:
     """DE-08 / FU-08: inside `area` expanded by `margin_degrees` on every side
-    (edges inclusive)."""
-    return (
-        area.min_latitude - margin_degrees <= latitude <= area.max_latitude + margin_degrees
-        and area.min_longitude - margin_degrees <= longitude <= area.max_longitude + margin_degrees
-    )
+    (edges inclusive, as the decimal values written in config: see
+    `SERVICE_AREA_EDGE_DECIMALS`)."""
+    min_lat, max_lat, min_lon, max_lon = service_area_edges(area, margin_degrees)
+    return min_lat <= latitude <= max_lat and min_lon <= longitude <= max_lon
 
 
 def validate_against_thresholds(

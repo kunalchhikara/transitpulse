@@ -1,6 +1,7 @@
 """DE-08 criterion 4: with the default configuration, the new Silver rules
-(`service_area`, `delay_range`, `timestamp_bounds`, `watermark_guard`)
-produce ZERO new quarantines on valid simulator output:
+(`service_area`, `delay_range`, `timestamp_bounds`; `arrival_time_skew` is
+opt-in and off) produce ZERO new quarantines, and the stream-relative
+watermark guard holds back ZERO events, on valid simulator output:
 
 * DE-02 baseline output (no incidents);
 * DE-03 congestion and breakdown output (degraded but valid values);
@@ -8,7 +9,7 @@ produce ZERO new quarantines on valid simulator output:
 
 Each sweep goes through the real DE-05 Bronze and DE-06 Silver code, so the
 rules are applied exactly as `run_silver` applies them (DE-01 service area,
-Bronze ingestion time as the watermark-guard reference)."""
+the watermark guard over the arrival-ordered stream)."""
 
 from __future__ import annotations
 
@@ -27,9 +28,10 @@ from simulator.tests._silver_helpers import (
     bronze_from_lines,
     run_incident_stream,
     silver,
+    table,
 )
 
-NEW_RULES = ("service_area", "delay_range", "timestamp_bounds", "watermark_guard")
+NEW_RULES = ("service_area", "delay_range", "timestamp_bounds", "arrival_time_skew")
 EVENTS = 3000
 
 
@@ -40,6 +42,8 @@ def _assert_no_quarantine(result, expected_valid: int) -> None:
     assert counters["quarantined"] == 0, counters["quarantined_by_rule"]
     assert counters["valid_loaded"] == expected_valid
     assert counters["watermark_guarded"] == 0
+    assert counters["quarantined_watermark_guarded"] == 0
+    assert all(r["_silver_watermark_guarded"] is False for r in table(result, "clean"))
     assert result.manifest["reconciliation"]["holds"]
 
 

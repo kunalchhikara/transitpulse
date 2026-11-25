@@ -34,7 +34,7 @@ from simulator.incidents.injector import IncidentInjector
 from simulator.incidents.logging_setup import configure_incident_logging
 from simulator.reference.generator import generate_reference_dataset
 from simulator.silver import load_silver_config, run_silver
-from simulator.silver.rules import TelemetryValidator, WatermarkGuard
+from simulator.silver.rules import ArrivalTimeSkew, TelemetryValidator
 from simulator.tests._bronze_helpers import (
     FIXED_CLOCK,
     REPO_ROOT,
@@ -49,12 +49,17 @@ PROCESSING_CLOCK = fixed_clock(PROCESSING_TIME)
 SILVER_CONFIG = load_silver_config()
 THRESHOLDS = load_validation_thresholds()
 DELETE = object()
-#: The DE-08 service area and watermark guard exactly as `run_silver` passes
-#: them to `TelemetryValidator` with the default configuration.
+#: The DE-08 service area and (opt-in, default off) arrival-time-skew rule
+#: exactly as `run_silver` passes them to `TelemetryValidator` by default.
 PIPELINE_RULE_SETTINGS = {
     "service_area": load_scale_config().sydney_bounding_box,
-    "watermark_guard": WatermarkGuard.from_config(SILVER_CONFIG.watermark_guard),
+    "arrival_time_skew": ArrivalTimeSkew.from_config(SILVER_CONFIG.arrival_time_skew),
 }
+#: The opt-in clock-relative rule switched on (`mode = "quarantine"`).
+ARRIVAL_TIME_SKEW_ON = ArrivalTimeSkew.from_config(
+    type(SILVER_CONFIG.arrival_time_skew).model_validate(
+        {**SILVER_CONFIG.arrival_time_skew.model_dump(mode="json"), "mode": "quarantine"})
+)
 
 #: Expected primary Silver rule for each DE-03 malformed mode.
 MODE_RULES = {
@@ -86,21 +91,20 @@ def valid_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def validator(*, service_area=None, watermark_guard=None, **threshold_overrides: Any) -> TelemetryValidator:
-    """Without `service_area` / `watermark_guard` (the default) the DE-08
-    `service_area` and `watermark_guard` rules are not evaluated - pass
+def validator(*, service_area=None, arrival_time_skew=None, **threshold_overrides: Any) -> TelemetryValidator:
+    """Without `service_area` / `arrival_time_skew` (the default) the DE-08
+    `service_area` and `arrival_time_skew` rules are not evaluated - pass
     `**PIPELINE_RULE_SETTINGS` to validate exactly as `run_silver` does."""
     thresholds = THRESHOLDS.model_copy(update=threshold_overrides) if threshold_overrides else THRESHOLDS
     reference = generate_reference_dataset(load_scale_config())
     return TelemetryValidator(thresholds, [r.route_id for r in reference.routes], service_area=service_area,
-                              watermark_guard=watermark_guard)
+                              arrival_time_skew=arrival_time_skew)
 
 
 def validate(payload: dict[str, Any], *, ingestion_time: datetime = PROCESSING_TIME, service_area=None,
-             watermark_guard=None, **threshold_overrides: Any):
-    return validator(service_area=service_area, watermark_guard=watermark_guard, **threshold_overrides).validate(
-        payload, json.dumps(payload), ingestion_time=ingestion_time
-    )
+             arrival_time_skew=None, **threshold_overrides: Any):
+    return validator(service_area=service_area, arrival_time_skew=arrival_time_skew,
+                     **threshold_overrides).validate(payload, json.dumps(payload), ingestion_time=ingestion_time)
 
 
 # -- Bronze -> Silver ----------------------------------------------------------
@@ -161,14 +165,17 @@ class IncidentRun:
         )
 
 
-def run_incident_stream(incidents_config: IncidentsConfig, max_events: int) -> IncidentRun:
+def run_incident_stream(incidents_config: IncidentsConfig, max_events: int, *, generator_config=None) -> IncidentRun:
     """Run DE-03 exactly like its CLI (DE-02 runner with the rate hook and
     the injector's duplicate-delivering sink, then flush the reorder
-    buffer), on a fake clock, capturing the structured incident log."""
+    buffer), on a fake clock, capturing the structured incident log.
+    `generator_config` (default: DE-02's) e.g. moves `simulated_start_time`."""
     stream = io.StringIO()
     configure_incident_logging(level="INFO", stream=stream)
     try:
-        injector = IncidentInjector(build_generator(), incidents_config)
+        generator = build_generator(generator_config=generator_config) if generator_config is not None \
+            else build_generator()
+        injector = IncidentInjector(generator, incidents_config)
         payloads: list[dict[str, Any]] = []
         run(injector, injector.delivery_sink(payloads.append), clock=FakeClock(), max_events=max_events,
             rate_multiplier=injector.rate_multiplier)
@@ -263,7 +270,7 @@ def delivered_event_ids(lines: list[str]) -> list[str]:
 
 
 __all__ = [
-    "DELETE", "MODE_RULES", "PIPELINE_RULE_SETTINGS", "PROCESSING_CLOCK", "PROCESSING_TIME", "PROCESSING_TIME_STR", "REPO_ROOT",
+    "ARRIVAL_TIME_SKEW_ON", "DELETE", "MODE_RULES", "PIPELINE_RULE_SETTINGS", "PROCESSING_CLOCK", "PROCESSING_TIME", "PROCESSING_TIME_STR", "REPO_ROOT",
     "SILVER_CONFIG", "THRESHOLDS", "Expectations", "IncidentRun", "bronze_from_bytes", "bronze_from_lines",
     "clean_payloads", "delivered_event_ids", "derive_expectations", "fired", "lines_to_silver",
     "parse_incident_log", "run_incident_stream", "silver", "table", "valid_payload", "validate", "validator",

@@ -1,21 +1,26 @@
 """DE-08 Gold attribution hardening (BACKLOG FU-10, FU-11):
 
 * a quarantined record rejected by ANY Silver event-time rule
-  (`timestamp_bounds`, `future_time_tolerance`, `watermark_guard`) is
+  (`timestamp_bounds`, `future_time_tolerance`, opt-in `arrival_time_skew`) is
   unattributed (`event_time_rejected`);
 * a `supported_schema_version` failure is unattributed
   (`schema_version_unsupported`): field meaning is undefined under an unknown
   schema;
 * Silver evaluates stage-2 rules only for records that pass stage 1, so Gold
-  re-applies the event-time rules (bounds, future-time tolerance, watermark
-  guard - with the thresholds and Silver config recorded in the Silver
-  manifest) to every quarantined record it would attribute
+  re-applies the stateless event-time rules (bounds, future-time tolerance,
+  arrival_time_skew when Silver ran it - with the thresholds and Silver
+  config recorded in the Silver manifest) to every quarantined record it
+  would attribute
   (`event_time_rejected_on_recheck`; `event_time_unverifiable` when the
   reference instant is unusable);
 * no Gold row has a period outside the configured timestamp bounds.
 
 The expected Gold numbers for `HARDENING_LINES` were computed by hand from the
-table below, not by calling Gold code.
+table below, not by calling Gold code. The fixture runs Silver with the
+opt-in clock-relative rule `arrival_time_skew` switched on (`SKEW_ON`;
+ingestion 2025-02-01T09:30Z, skew 300 s), so every stateless event-time rule
+and its Gold re-check is exercised. The stream-relative watermark guard is
+covered at the end of this file (`_silver_watermark_guarded`).
 
 | id     | route    | event_time / generated_at          | defect        | Silver               | Gold                            |
 |--------|----------|------------------------------------|---------------|----------------------|---------------------------------|
@@ -24,9 +29,9 @@ table below, not by calling Gold code.
 | QB1    | ROUTE-01 | 0001-01-01 / same                  | speed -5      | non_negative_speed   | event_time_rejected_on_recheck  |
 | QB9    | ROUTE-01 | 9999-12-31T23:59:59 / same         | speed -5      | non_negative_speed   | event_time_rejected_on_recheck  |
 | QF     | ROUTE-01 | 2030-01-01 / 00:30                 | speed -5      | non_negative_speed   | event_time_rejected_on_recheck  |
-| QG     | ROUTE-01 | 2090-01-01 / same                  | speed -5      | non_negative_speed   | event_time_rejected_on_recheck  |
+| QG     | ROUTE-01 | 2090-01-01 / same                  | speed -5      | non_negative_speed   | event_time_rejected_on_recheck (arrival_time_skew) |
 | QT     | ROUTE-02 | 9999-12-31T23:59:59 / same         | -             | timestamp_bounds     | event_time_rejected             |
-| QW     | ROUTE-02 | 2090-01-01 / same                  | -             | watermark_guard      | event_time_rejected             |
+| QW     | ROUTE-02 | 2090-01-01 / same                  | -             | arrival_time_skew    | event_time_rejected             |
 | QU     | ROUTE-02 | 00:40 / "bad"                      | -             | parsable_timestamps  | event_time_unverifiable         |
 | Q1     | ROUTE-02 | 00:50 / 00:50                      | speed -5      | non_negative_speed   | R02 h00                         |
 
@@ -47,6 +52,7 @@ import pytest
 from simulator.bronze import fixed_clock
 from simulator.gold import GoldInputError, Periods, attribute_quarantined
 from simulator.gold.aggregate import (
+    UNATTRIBUTED_EVENT_TIME_HELD_BACK,
     UNATTRIBUTED_EVENT_TIME_RECHECK,
     UNATTRIBUTED_EVENT_TIME_REJECTED,
     UNATTRIBUTED_EVENT_TIME_UNPARSEABLE,
@@ -56,6 +62,7 @@ from simulator.gold.aggregate import (
     EventTimeCheck,
     aggregate_route_performance,
 )
+from simulator.silver import SILVER_MANIFEST_VERSION, SilverConfig
 from simulator.tests._bronze_helpers import REPO_ROOT
 from simulator.tests._gold_helpers import (
     gold,
@@ -67,6 +74,7 @@ from simulator.tests._gold_helpers import (
 from simulator.tests._silver_helpers import (
     SILVER_CONFIG,
     THRESHOLDS,
+    clean_payloads,
     silver,
     valid_payload,
 )
@@ -112,19 +120,31 @@ EXPECTED_UNATTRIBUTED = {
 }
 
 
+def _skew_on() -> SilverConfig:
+    data = SILVER_CONFIG.model_dump(mode="json")
+    data["arrival_time_skew"] = {**data["arrival_time_skew"], "mode": "quarantine"}
+    return SilverConfig.model_validate(data)
+
+
+SKEW_ON = _skew_on()
+
+
 def _hardening_gold(tmp_path):
-    silver_from_lines(tmp_path, HARDENING_LINES)
+    silver_from_lines(tmp_path, HARDENING_LINES, config=SKEW_ON)
     return gold(tmp_path)
 
 
 def test_silver_outcome_is_what_the_hand_computation_assumes(tmp_path):
-    result = silver_from_lines(tmp_path, HARDENING_LINES)
+    result = silver_from_lines(tmp_path, HARDENING_LINES, config=SKEW_ON)
     assert [r["event_id"] for r in silver_table(result, "clean")] == ["E1"]
     assert {r["event_id"]: r["primary_rule"] for r in silver_table(result, "quarantine")} == {
         "QS": "supported_schema_version", "QB1": "non_negative_speed", "QB9": "non_negative_speed",
         "QF": "non_negative_speed", "QG": "non_negative_speed", "QT": "timestamp_bounds",
-        "QW": "watermark_guard", "QU": "parsable_timestamps", "Q1": "non_negative_speed",
+        "QW": "arrival_time_skew", "QU": "parsable_timestamps", "Q1": "non_negative_speed",
     }
+    # One valid event: nothing for the stream-relative guard to hold back.
+    assert result.manifest["counters"]["watermark_guarded"] == 0
+    assert result.manifest["counters"]["quarantined_watermark_guarded"] == 0
 
 
 def test_gold_attribution_matches_the_hand_computation(tmp_path):
@@ -155,11 +175,15 @@ def test_no_gold_row_has_a_period_outside_the_configured_bounds(tmp_path):
 def test_attribution_settings_are_recorded_in_the_gold_manifest(tmp_path):
     manifest = _hardening_gold(tmp_path).manifest
     attribution = manifest["attribution"]
-    assert attribution["event_time_rules"] == ["timestamp_bounds", "future_time_tolerance", "watermark_guard"]
+    assert attribution["event_time_rules"] == ["timestamp_bounds", "future_time_tolerance", "arrival_time_skew"]
+    assert attribution["rechecked_rules"] == ["timestamp_bounds", "future_time_tolerance", "arrival_time_skew"]
     assert attribution["min_timestamp"] == "2000-01-01T00:00:00Z"
     assert attribution["max_timestamp"] == "2100-01-01T00:00:00Z"
     assert attribution["future_time_reference"] == "generated_at"
-    assert attribution["watermark_guard"]["mode"] == "quarantine"
+    assert attribution["arrival_time_skew"]["mode"] == "quarantine"
+    # The stream-relative guard is recorded, and explicitly NOT re-applied.
+    assert attribution["watermark_guard"]["silver_config"]["mode"] == "flag"
+    assert "not re-applied" in attribution["watermark_guard"]["gold"]
 
 
 def test_the_qa_year_0001_record_is_no_longer_attributed(tmp_path):
@@ -173,17 +197,37 @@ def test_the_qa_year_0001_record_is_no_longer_attributed(tmp_path):
 
 def test_pre_de08_silver_manifest_is_refused(tmp_path):
     """Gold re-applies the thresholds Silver recorded; a Silver manifest
-    written before DE-08 has no timestamp bounds or watermark guard, so Gold
-    refuses it (fail closed) rather than guess."""
+    written before DE-08 (silver_manifest_version 1.0.0) has no timestamp
+    bounds or guard settings, so Gold refuses it (fail closed) rather than
+    guess - with a short message, no raw validation dump."""
     silver_from_lines(tmp_path, HARDENING_LINES[:1])
     path = tmp_path / "silver" / "_runs" / "s1.json"
     manifest = json.loads(path.read_text())
+    assert manifest["silver_manifest_version"] == "1.1.0"
+    manifest["silver_manifest_version"] = "1.0.0"
     del manifest["validation_thresholds"]["max_timestamp"]
     del manifest["config"]["watermark_guard"]
+    del manifest["config"]["arrival_time_skew"]
     path.write_text(json.dumps(manifest))
-    with pytest.raises(GoldInputError, match="re-run Silver"):
+    with pytest.raises(GoldInputError) as raised:
         gold(tmp_path)
+    assert str(raised.value) == (
+        "Silver run 's1' has silver_manifest_version '1.0.0'; Gold needs '1.1.0' (DE-08 event-time settings). "
+        "Re-run Silver with the current code under a new --run-id, then run Gold on it"
+    )
     assert not (tmp_path / "gold" / "route_performance").exists()
+
+
+def test_a_1_1_0_manifest_missing_settings_is_refused_concisely(tmp_path):
+    silver_from_lines(tmp_path, HARDENING_LINES[:1])
+    path = tmp_path / "silver" / "_runs" / "s1.json"
+    manifest = json.loads(path.read_text())
+    del manifest["config"]["arrival_time_skew"]
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(GoldInputError, match="re-run Silver") as raised:
+        gold(tmp_path)
+    assert "validation error" not in str(raised.value) and "pydantic" not in str(raised.value)
+    assert len(str(raised.value)) < 250
 
 
 def test_committed_silver_manifest_with_failed_reconciliation_blocks_every_gold_run(tmp_path):
@@ -205,6 +249,11 @@ def test_committed_silver_manifest_with_failed_reconciliation_blocks_every_gold_
 def test_cli_chain_is_byte_identical_across_two_processes(tmp_path):
     source = tmp_path / "events.ndjson"
     source.write_text("\n".join(HARDENING_LINES) + "\n")
+    # The bundled Silver config with the opt-in arrival_time_skew rule on.
+    default_toml = (REPO_ROOT / "simulator" / "silver" / "default_silver.toml").read_text()
+    assert default_toml.count('mode = "off"') == 1
+    silver_config = tmp_path / "silver_skew_on.toml"
+    silver_config.write_text(default_toml.replace('mode = "off"', 'mode = "quarantine"'))
 
     def run(*args: str) -> None:
         subprocess.run([sys.executable, "-m", *args], cwd=REPO_ROOT, check=True, capture_output=True)
@@ -214,7 +263,8 @@ def test_cli_chain_is_byte_identical_across_two_processes(tmp_path):
         run("simulator.bronze", "stream", "--input", str(source), "--run-id", "b1", "--output-dir",
             str(root / "bronze"), "--fixed-ingestion-time", "2025-02-01T09:30:00Z")
         run("simulator.silver", "--run-id", "s1", "--bronze-dir", str(root / "bronze"), "--output-dir",
-            str(root / "silver"), "--fixed-processing-time", "2025-02-01T10:00:00Z")
+            str(root / "silver"), "--fixed-processing-time", "2025-02-01T10:00:00Z",
+            "--silver-config", str(silver_config))
         run("simulator.gold", "--run-id", "g1", "--silver-dir", str(root / "silver"), "--output-dir",
             str(root / "gold"), "--fixed-processing-time", "2025-02-01T11:00:00Z")
     for store in ("silver", "gold"):
@@ -225,9 +275,13 @@ def test_cli_chain_is_byte_identical_across_two_processes(tmp_path):
 
 # -- attribution rule, unit level ---------------------------------------------------------
 
-SILVER_MANIFEST = {"validation_thresholds": THRESHOLDS.model_dump(mode="json"),
-                   "config": SILVER_CONFIG.fingerprint_fields()}
+SILVER_MANIFEST = {"silver_manifest_version": SILVER_MANIFEST_VERSION, "run_id": "s1",
+                   "validation_thresholds": THRESHOLDS.model_dump(mode="json"),
+                   "config": SKEW_ON.fingerprint_fields()}
+#: arrival_time_skew ON (quarantine, vs ingestion_time, 300 s).
 CHECK = EventTimeCheck.from_silver_manifest(SILVER_MANIFEST)
+SKEW = {"mode": "quarantine", "reference": "ingestion_time", "max_skew_seconds": 300}
+SKEW_OFF = {**SKEW, "mode": "off"}
 
 
 def _check(**config) -> EventTimeCheck:
@@ -259,7 +313,7 @@ R01_H00 = ("ROUTE-01", datetime(2025, 1, 1, tzinfo=UTC))
         # Every Silver event-time rule -> event_time_rejected.
         (_q(_p(Y9), rules=("timestamp_bounds",)), CHECK, UNATTRIBUTED_EVENT_TIME_REJECTED),
         (_q(_p(Y9), rules=("timestamp_bounds",)), None, UNATTRIBUTED_EVENT_TIME_REJECTED),
-        (_q(_p(Y2090), rules=("watermark_guard",)), CHECK, UNATTRIBUTED_EVENT_TIME_REJECTED),
+        (_q(_p(Y2090), rules=("arrival_time_skew",)), CHECK, UNATTRIBUTED_EVENT_TIME_REJECTED),
         (_q(_p(_t("02:00"), _t("00:00")), rules=("future_time_tolerance",)), CHECK,
          UNATTRIBUTED_EVENT_TIME_REJECTED),
         # Re-check of a stage-1 reject: bounds (event_time, generated_at), future tolerance, guard.
@@ -272,16 +326,19 @@ R01_H00 = ("ROUTE-01", datetime(2025, 1, 1, tzinfo=UTC))
         (_q(_p(Y2090)), CHECK, UNATTRIBUTED_EVENT_TIME_RECHECK),
         # Without a check (DE-07 behaviour) the far-future stage-1 reject would be attributed.
         (_q(_p(Y2090)), None, ("ROUTE-01", datetime(2090, 1, 1, tzinfo=UTC))),
-        # Guard off / flag: the guard is not a Silver rule then, so it is not re-applied.
-        (_q(_p(Y2090)), _check(watermark_guard={"mode": "off", "reference": "ingestion_time",
-                                                "max_skew_seconds": 300}),
+        # arrival_time_skew off (the default): not a Silver rule then, so not re-applied.
+        (_q(_p(Y2090)), _check(arrival_time_skew=SKEW_OFF), ("ROUTE-01", datetime(2090, 1, 1, tzinfo=UTC))),
+        # ... and the stream-relative guard is never re-applied: Gold uses Silver's flag.
+        (_q(_p(Y2090)) | {"_silver_watermark_guarded": False}, _check(arrival_time_skew=SKEW_OFF),
          ("ROUTE-01", datetime(2090, 1, 1, tzinfo=UTC))),
-        (_q(_p(Y2090)), _check(watermark_guard={"mode": "flag", "reference": "ingestion_time",
-                                                "max_skew_seconds": 300}),
-         ("ROUTE-01", datetime(2090, 1, 1, tzinfo=UTC))),
-        # Guard reference = processing_time: 20 min after ingestion, before processing -> fine.
-        (_q(_p("2025-02-01T09:50:00Z")), _check(watermark_guard={
-            "mode": "quarantine", "reference": "processing_time", "max_skew_seconds": 300}),
+        (_q(_p(Y2090)) | {"_silver_watermark_guarded": True}, _check(arrival_time_skew=SKEW_OFF),
+         UNATTRIBUTED_EVENT_TIME_HELD_BACK),
+        (_q(_p(_t("00:10"))) | {"_silver_watermark_guarded": True}, None, UNATTRIBUTED_EVENT_TIME_HELD_BACK),
+        (_q(_p(_t("00:10"))) | {"_silver_watermark_guarded": None}, CHECK, R01_H00),
+        # Precedence: a re-check failure is reported before Silver's guard flag.
+        (_q(_p(Y2090)) | {"_silver_watermark_guarded": True}, CHECK, UNATTRIBUTED_EVENT_TIME_RECHECK),
+        # Skew reference = processing_time: 20 min after ingestion, before processing -> fine.
+        (_q(_p("2025-02-01T09:50:00Z")), _check(arrival_time_skew={**SKEW, "reference": "processing_time"}),
          ("ROUTE-01", datetime(2025, 2, 1, 9, tzinfo=UTC))),
         (_q(_p("2025-02-01T09:50:00Z")), CHECK, UNATTRIBUTED_EVENT_TIME_RECHECK),
         # future_time_reference = ingestion_time.
@@ -294,9 +351,7 @@ R01_H00 = ("ROUTE-01", datetime(2025, 1, 1, tzinfo=UTC))
         (_q({"route_id": "ROUTE-01", "event_time": _t("00:10")}, rules=("required_fields",)), CHECK,
          UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE),
         (_q(_p(_t("00:10")), ingestion_time=None), CHECK, UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE),
-        (_q(_p(_t("00:10")), ingestion_time=None),
-         _check(watermark_guard={"mode": "off", "reference": "ingestion_time", "max_skew_seconds": 300}),
-         R01_H00),
+        (_q(_p(_t("00:10")), ingestion_time=None), _check(arrival_time_skew=SKEW_OFF), R01_H00),
         # Precedence: an unparseable event_time is reported before any check.
         (_q(_p("not-a-time", _t("00:00"))), CHECK, UNATTRIBUTED_EVENT_TIME_UNPARSEABLE),
         # A normal stage-1 reject is still attributed.
@@ -319,11 +374,52 @@ def test_clean_record_outside_the_bounds_breaks_the_silver_contract():
 @pytest.mark.parametrize(
     "manifest",
     [
-        {"config": SILVER_MANIFEST["config"]},
-        {"validation_thresholds": SILVER_MANIFEST["validation_thresholds"]},
-        {**SILVER_MANIFEST, "config": {**SILVER_MANIFEST["config"], "watermark_guard": {"mode": "x"}}},
+        {k: v for k, v in SILVER_MANIFEST.items() if k != "validation_thresholds"},
+        {k: v for k, v in SILVER_MANIFEST.items() if k != "config"},
+        {**SILVER_MANIFEST, "config": {**SILVER_MANIFEST["config"], "watermark_guard": {"mode": "quarantine"}}},
+        {**SILVER_MANIFEST, "config": {**SILVER_MANIFEST["config"], "arrival_time_skew": {"mode": "flag"}}},
+        {**SILVER_MANIFEST, "silver_manifest_version": "1.0.0"},
+        {k: v for k, v in SILVER_MANIFEST.items() if k != "silver_manifest_version"},
     ],
 )
 def test_event_time_check_needs_a_de08_silver_manifest(manifest):
-    with pytest.raises(GoldInputError, match="re-run Silver"):
+    with pytest.raises(GoldInputError, match="(?i)re-run Silver"):
         EventTimeCheck.from_silver_manifest(manifest)
+
+
+# -- the stream-relative watermark guard through Silver and Gold (default config) ------------
+
+
+def test_gold_uses_silvers_watermark_guard_verdicts(tmp_path):
+    """Default config. A fleet stream (DE-02, 2025-01-01 00:00..00:01:40) with
+    a valid outlier (clean, held back) and a negative-speed outlier
+    (quarantined, held back), both 2025-01-02 (a day ahead):
+
+    * the clean outlier is counted in its own period (a valid observation,
+      flagged by Silver - like a late row) and reconciled as
+      `watermark_guarded_event_count`;
+    * the quarantined one is NOT attributed to that period
+      (`event_time_held_back_by_watermark_guard`), using Silver's verdict;
+    * a normal negative-speed record is still attributed (R01 h00)."""
+    lines = [json.dumps(p) for p in clean_payloads(1000)]
+    held_clean = json.dumps(_event("OUT-C", "ROUTE-01", "2025-01-02T00:00:00Z"))
+    held_quarantined = json.dumps(_event("OUT-Q", "ROUTE-02", "2025-01-02T00:00:00Z", speed_kmh=-5.0))
+    normal_quarantined = json.dumps(_event("Q-OK", "ROUTE-01", _t("00:00"), speed_kmh=-5.0))
+    lines = lines[:25] + [held_clean, held_quarantined, normal_quarantined] + lines[25:]
+    silver_result = silver_from_lines(tmp_path, lines)
+    counters = silver_result.manifest["counters"]
+    assert (counters["watermark_guarded"], counters["quarantined_watermark_guarded"]) == (1, 1)
+    quarantine = {r["event_id"]: r for r in silver_table(silver_result, "quarantine")}
+    assert quarantine["OUT-Q"]["_silver_watermark_guarded"] is True
+    assert quarantine["Q-OK"]["_silver_watermark_guarded"] is False
+
+    result = gold(tmp_path)
+    gold_counters = result.manifest["counters"]
+    assert gold_counters["watermark_guarded_event_count"] == 1
+    assert result.manifest["reconciliation"]["checks"]["watermark_guarded_equals_silver"] is True
+    assert gold_counters["unattributed_by_reason"][UNATTRIBUTED_EVENT_TIME_HELD_BACK] == 1
+    assert gold_counters["quarantined_attributed"] == 1
+    outlier_rows = [r for r in gold_rows(result) if r["period_start"].startswith("2025-01-02")]
+    assert [(r["route_id"], r["event_count"], r["quarantined_count"]) for r in outlier_rows] == [
+        ("ROUTE-01", 1, 0)]
+    assert result.manifest["reconciliation"]["holds"]

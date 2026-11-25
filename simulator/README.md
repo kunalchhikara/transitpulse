@@ -1316,11 +1316,13 @@ repeats, which is exactly what "no downstream double-counting" protects.
 Precedence is the table order. Thresholds come from DE-01's
 `ValidationThresholds` (`simulator/config/default_validation.toml`); Silver
 does not duplicate them. The service area is DE-01's `sydney_bounding_box`
-(`default_scale.toml`). Only the watermark guard (rule 16), being event-time
-*state* policy like `allowed_lateness_seconds` and `future_time_reference`, is
-configured in `[silver.watermark_guard]`. Rules 6, 12, 14 and 16 were added
-by DE-08 (BACKLOG FU-06, FU-08, FU-10); every rule id is also listed in the
-manifest's `rule_catalogue`.
+(`default_scale.toml`). Only the opt-in clock-relative rule 16, being
+arrival policy like `future_time_reference`, is configured in
+`[silver.arrival_time_skew]`. Rules 6, 12, 14 and 16 were added by DE-08
+(BACKLOG FU-08, FU-10); every rule id is also listed in the manifest's
+`rule_catalogue`. The FU-06 **watermark guard is not a rule**: it is
+event-time *state* (stream-relative), never quarantines, and is described
+under "Watermark guard" below.
 
 | # | Rule id | Category | PROJECT.md section 12 rule | Check (default) | DE-03 mode that triggers it |
 |---|---|---|---|---|---|
@@ -1330,7 +1332,7 @@ manifest's `rule_catalogue`.
 | 3 | `parsable_timestamps` | schema | parsable timestamps | `generated_at`/`event_time` are ISO-8601 date-time strings **with a UTC offset** | `malformed_timestamp` |
 | 4 | `schema_conformance` | schema | (type enforcement, section 8) | strict `TelemetryEvent`: JSON types not coerced, `status` enum, no unknown fields, float fields finite (a number overflowing float64, e.g. `1e400` -> inf, is rejected here regardless of thresholds) | - |
 | 5 | `valid_coordinates` | rule | valid latitude/longitude | latitude in [-90, 90], longitude in [-180, 180] | `invalid_coordinates` |
-| 6 | `service_area` | rule | valid latitude/longitude (service area) | position inside `sydney_bounding_box` (lat -34.05..-33.55, lon 150.55..151.35) expanded by `service_area_margin_degrees` (0.05) on every side, edges inclusive, when `require_service_area` (true). `(0, 0)` is rejected. | - (`invalid_coordinates` (999, -999) fails rule 5 in stage 1, so rule 5 stays its primary and only rule) |
+| 6 | `service_area` | rule | valid latitude/longitude (service area) | position inside `sydney_bounding_box` (lat -34.05..-33.55, lon 150.55..151.35) expanded by `service_area_margin_degrees` (0.05) on every side, i.e. lat -34.10..-33.50, lon 150.50..151.40, edges inclusive (the expanded edges are rounded to 9 dp, ~0.1 mm, so -34.05 - 0.05 is exactly the -34.10 written here rather than the floating-point -34.099999999999994), when `require_service_area` (true). `(0, 0)` is rejected. | - (`invalid_coordinates` (999, -999) fails rule 5 in stage 1, so rule 5 stays its primary and only rule) |
 | 7 | `non_negative_speed` | rule | nonnegative speed | `speed_kmh >= 0` and `>= min_speed_kmh` (0) | `negative_speed` |
 | 8 | `max_speed` | rule | configurable upper-speed threshold | `speed_kmh <= max_speed_kmh` (120) | - |
 | 9 | `non_negative_occupancy` | rule | nonnegative occupancy | `occupancy >= 0` and `>= min_occupancy` (0) | - |
@@ -1340,12 +1342,12 @@ manifest's `rule_catalogue`.
 | 13 | `known_route` | rule | known route where applicable | `route_id` is a DE-01 reference route (when `require_known_route`) | `unknown_route` |
 | 14 | `timestamp_bounds` | rule | parsable timestamps (absolute bounds) | `min_timestamp <= event_time <= max_timestamp` and the same for `generated_at` (2000-01-01T00:00Z .. 2100-01-01T00:00Z), inclusive. `9999-12-31` and `0001-01-01` are rejected. | - |
 | 15 | `future_time_tolerance` | rule | future-time tolerance | `event_time <= generated_at + future_time_tolerance_seconds` (120) | - |
-| 16 | `watermark_guard` | rule | future-time tolerance (watermark guard) | `event_time <= ingestion_time + max_skew_seconds` (300); only in `mode = "quarantine"` (default). See "Watermark guard". | - (late/out-of-order events are *behind* their arrival, never ahead) |
+| 16 | `arrival_time_skew` | rule | future-time tolerance (arrival clock, **opt-in**) | **Off by default** (`[silver.arrival_time_skew] mode = "off"`). With `mode = "quarantine"`: `event_time <= arrival + max_skew_seconds` (300), arrival = Bronze `ingestion_time` (default) or Silver `processing_time`. Only for live feeds whose producers share the ingestion clock: on simulated/replayed data it is wrong (a 2027-simulated stream, or any `--fixed-ingestion-time` before the data, would be quarantined wholesale). | - |
 
 The DE-08 defaults were chosen against valid simulator output (DE-02/DE-03
 delays -30..420 s, DE-04 historical -102..3259 s, every position inside the
-DE-01 box) and are tested to quarantine **nothing** there
-(`test_silver_false_positives.py`).
+DE-01 box) and are tested to quarantine **nothing**, and to hold back
+nothing with the watermark guard, there (`test_silver_false_positives.py`).
 
 **Schema failure vs rule failure vs parse error** (the section 12/15
 counters): a *parse error* is a line Bronze could not store as a JSON object;
@@ -1366,8 +1368,8 @@ if stage 1 passed (the business rules need a typed event) and calls DE-01's
 each reason it returns is mapped to a rule id via
 `simulator.silver.rules.THRESHOLD_REASON_RULES`, and an unmapped reason raises
 `ValidationContractError` rather than producing an unlabelled rejection
-(tested against every DE-01 reason). The watermark guard (rule 16) is
-evaluated in stage 2 as well. So a record with a
+(tested against every DE-01 reason). The opt-in `arrival_time_skew` (rule
+16) is evaluated in stage 2 as well. So a record with a
 negative speed *and* an unknown route is quarantined as `non_negative_speed`
 only; one with two threshold failures lists both. The quarantine record keeps
 `rejection_rules` (all, in precedence order), `primary_rule` (the first, used
@@ -1389,11 +1391,12 @@ not truncated to an occupancy (PROJECT.md section 8 "type enforcement").
 reaches stage 2, so it is reported as `valid_coordinates` only, and an
 in-range position outside Sydney is `service_area` (primary over every other
 threshold rule, e.g. `(0, 0)` with speed 500 -> `service_area`, `max_speed`).
-`timestamp_bounds` precedes `future_time_tolerance` and `watermark_guard`, so an
+`timestamp_bounds` precedes `future_time_tolerance` and `arrival_time_skew`, so an
 absurd timestamp is reported as such (e.g. event_time `9999-12-31` with a
 normal generated_at -> `timestamp_bounds`, `future_time_tolerance`). The
-absolute bounds remove unrepresentable/absurd instants first; the watermark
-guard handles plausible-but-wrong ones. Before DE-08 a valid-looking event
+absolute bounds remove unrepresentable/absurd instants first (quarantined);
+the stream-relative watermark guard handles plausible-but-wrong ones (loaded
+and flagged). Before DE-08 a valid-looking event
 dated `9999-12-31` or `0001-01-01` crashed the Silver run (datetime overflow
 in the future-time check or the watermark); both are now quarantined and the
 bounds config is validated so every in-bounds instant stays representable
@@ -1414,8 +1417,10 @@ wholesale). `future_time_reference = "ingestion_time"` is available for live
 feeds, where it additionally catches a producer whose whole clock
 (`generated_at` included) runs fast. A late event is never a future-time
 failure. With the default `generated_at` reference, a producer whose whole
-clock runs fast is caught by the DE-08 watermark guard instead (measured
-against arrival; see "Watermark guard").
+clock runs fast is not rejected; if its readings jump ahead of the rest of
+the stream, the DE-08 watermark guard holds them back (stream-relative; see
+"Watermark guard"), and the opt-in `arrival_time_skew` rule can quarantine
+them on a live feed.
 
 ### Deduplication policy
 
@@ -1444,9 +1449,9 @@ event_time <  watermark              -> late          (LOADED, flagged, counted 
 
 Only valid, non-duplicate events advance the maximum: a corrupt future
 timestamp must not make every later event "late", and a replay must not move
-time. Since DE-08 a *valid-looking* far-future event cannot move it either
-(watermark guard, below): it is quarantined, or loaded flagged without
-advancing the maximum. **Late events are loaded and flagged rather than routed to a separate
+time. Since DE-08 a *valid-looking* event that jumps ahead of the rest of
+the stream cannot move it either (watermark guard, below): it is loaded,
+flagged and does not advance the maximum. **Late events are loaded and flagged rather than routed to a separate
 bucket** because they are valid observations (section 12 forbids invalid
 events silently disappearing; late ones are not even invalid), historical/
 batch Gold (DE-07, Warehouse) should include them, and a streaming aggregate
@@ -1454,8 +1459,8 @@ whose window has already closed can exclude them with one predicate on
 `_silver_event_time_status`. Each clean record carries
 `_silver_event_time_status`, `_silver_lateness_seconds` (max seen minus
 event_time; 0 when in order), `_silver_watermark` (the watermark at
-arrival) and `_silver_watermark_guarded` (see below; always `false` unless
-the guard runs in `flag` mode). The default lateness (60 s) matches DE-03's
+arrival) and `_silver_watermark_guarded` (see below; `true` only for an
+event the guard held back). The default lateness (60 s) matches DE-03's
 documented consumer threshold (`late_threshold_seconds`) but is Silver's own
 setting. The watermark is evaluated per record (a micro-batch of one); a
 Spark job evaluates it per micro-batch (see the mapping below).
@@ -1467,34 +1472,100 @@ valid-looking event whose `generated_at` **and** `event_time` were both far
 in the future. It passes `future_time_tolerance` (measured against its own
 `generated_at`), it can be inside the absolute `timestamp_bounds`, and it
 moved the maximum so far ahead that nearly every later event was flagged
-late (QA: 259 late vs 22; the DE-08 regression stream: 935 vs 26). The guard
-measures `event_time` against the record's **arrival** instead - an event
-cannot have been observed more than `max_skew_seconds` after it arrived
-(the same idea as a message broker refusing timestamps too far ahead of its
-own clock):
+late (QA: 259 late vs 22; the DE-08 regression stream: 935 vs 26).
+
+**Stream-relative, not clock-relative (QA D1 of PR #16).** A first version
+compared `event_time` with the record's arrival clock (Bronze
+`ingestion_time` + 300 s). That is wrong for this platform in both
+directions: simulated time has nothing to do with the ingestion clock, so an
+outlier dated *before* the ingestion clock (a 2025 stream ingested in 2026
+plus one event dated 2025-01-02 or 2026-06-01) slipped through (late 979 vs
+53), while valid data *ahead* of the ingestion clock (a stream simulated
+from 2027, or any `--fixed-ingestion-time` earlier than the data, including
+DE-04 history) was quarantined wholesale. The guard now judges an event only
+against **the stream around it, in arrival order** - no clock is involved,
+so the result depends only on the records and their order (deterministic,
+replayable, portable to Spark):
 
 ```
-event_time > reference + max_skew_seconds   -> guard trips
-reference = Bronze ingestion_time of the record (default) | this Silver run's processing_time
+jump(E)      = no watermark yet, or E.event_time > max_event_time + max_jump_seconds
+window(E)    = the next lookahead_events valid, first-seen events after E (arrival order)
+corroborated = >= min_corroborating_vehicles distinct vehicles OTHER than E's have an event in
+               window(E) with event_time >= E.event_time - max_jump_seconds    ("the fleet is there too")
+contradicted = >= min_contradicting_vehicles distinct vehicles (E's included) have an event in
+               window(E) with event_time <  E.event_time - max_jump_seconds    ("the stream carries on far behind")
+held back    = jump(E) and not corroborated and contradicted
 ```
+
+A held-back event is **loaded** (it is valid by every rule), flagged
+`_silver_watermark_guarded = true`, classified against the current watermark
+(it is ahead, so `in_order`) and **never advances the watermark**; it is
+counted in `watermark_guarded`. Every other event advances the watermark
+exactly as without the guard. Because a decision may need later events,
+Silver keeps records in arrival order in a small buffer until each pending
+decision is final (at most `lookahead_events` valid events plus interleaved
+rejects; peak recorded as `event_time.max_buffered_records`); output order is
+unchanged. A corroborating event can therefore never change an earlier
+event's flag: for a genuine jump every event is classified exactly as the
+unguarded watermark would classify it, and for a held-back outlier every
+other event is classified exactly as if the outlier were absent.
 
 | `[silver.watermark_guard]` key | Default | Meaning |
 |---|---|---|
-| `mode` | `"quarantine"` | `quarantine`: reject under rule `watermark_guard` (never clean, never advances the watermark). `flag`: load it with `_silver_watermark_guarded = true`; it is classified against the current watermark (usually `in_order`) but **never advances it**; counted in `watermark_guarded`. `off`: no guard (pre-DE-08 behaviour, which reproduces FU-06). |
-| `reference` | `"ingestion_time"` | `ingestion_time` is recorded in Bronze, so a replay of the same Bronze runs gives the same result; `processing_time` uses this Silver run's clock (wider for back-loaded data, but depends on when Silver runs). |
-| `max_skew_seconds` | `300` | Allowed producer/ingestion clock skew. Inclusive. |
+| `mode` | `"flag"` | `flag`: hold back as above. `off`: no guard (pre-DE-08 behaviour, which reproduces FU-06). |
+| `max_jump_seconds` | `900` | A forward jump larger than this must be consistent with the stream that follows it. Smaller than the outliers QA reproduced (1 day+), larger than any uncorroborated gap in valid DE-02/03/04 output. |
+| `lookahead_events` | `100` | How many later valid, first-seen events are examined (and the bound on how long a decision can wait). |
+| `min_corroborating_vehicles` | `2` | Distinct other vehicles needed to accept a jump. Up to this many clustered outliers from distinct vehicles (and any number from a single vehicle, e.g. one whose clock runs a day fast) cannot corroborate each other. |
+| `min_contradicting_vehicles` | `2` | Distinct vehicles behind the jump needed to hold it back. One vehicle alone is never enough evidence: "one reading ahead, then that vehicle far behind it" is ambiguous (a glitch, or genuinely late readings), so the unguarded result is kept. |
 
-`quarantine` is the default because a far-future reading is not a valid
-observation (and in `flag` mode it would still reach Gold as a far-future
-row). With no outlier present every mode gives byte-identical tables and the
-oracle's flags (tested, so all DE-06/DE-07 results are unchanged). The
-regression test (`test_silver_watermark_guard.py`) compares every other
-event's late/out-of-order flag with a baseline computed without Silver code
-(the DE-03 incident log + a clean DE-02 generator). Replays of simulated
-data are unaffected: they are ingested after the time they simulate. A
-stream simulated *ahead* of the wall clock (future `simulated_start_time`)
-must be ingested with a matching fixed ingestion time, or run with
-`mode = "flag"`/`"off"`.
+**Why loaded-and-flagged, not quarantined.** Quarantine means "this record
+is invalid by its own content and the configured rules"; the guard's
+verdict is statistical and depends on *other* records (a genuine jump near
+the end of the input, or in a very sparse stream, may lack corroboration).
+Absurd instants are already quarantined by FU-10 `timestamp_bounds`
+(2000..2100), so what remains is a plausible timestamp whose only problem is
+where it sits in the stream - exactly what a flag (like `late`) expresses.
+It also keeps dedup simple: a held-back event still claims its `event_id`.
+A quarantined record whose `event_time` is usable (parseable, inside the
+bounds) gets the same verdict in its own `_silver_watermark_guarded`
+(`quarantined_watermark_guarded`; null when the time is unusable) - it never
+moves the watermark and is never evidence - so Gold can decide whether to
+attribute it (DE-07 "Quarantine attribution").
+
+**What it still cannot catch / trade-offs.**
+- An outlier less than `max_jump_seconds` (15 min) ahead is not a jump: it
+  advances the watermark and can flag up to 15 min of later events late
+  (at DE-02's 10 events/s, many events). Lowering the threshold makes more
+  natural gaps "jumps" (DE-04 history, which is ordered by trip, then holds
+  events back at 300 s with the other defaults).
+- More than `min_corroborating_vehicles` outliers from distinct vehicles,
+  clustered within one another's lookahead, corroborate each other and are
+  accepted (QA's case is one outlier; the default tolerates two).
+- An outlier followed by fewer than `min_contradicting_vehicles` vehicles
+  (end of input, or a single-vehicle stream) is accepted - then it can only
+  affect the few events after it.
+- A *backward* outlier (one event far in the past) never moves the
+  watermark anyway; it is simply flagged `late`.
+- Decisions are per Silver run (each run is a full snapshot); a Spark port
+  needs a single-key stateful operator holding the pending buffer (see
+  "Mapping to Fabric").
+
+The clock-relative check is kept as the **opt-in** rule `arrival_time_skew`
+(rule 16, `[silver.arrival_time_skew]`, `mode = "off"` by default,
+`"quarantine"` to enable; `reference` = `ingestion_time` | `processing_time`;
+`max_skew_seconds` = 300). Enable it only for a live feed whose producers
+share the ingestion clock.
+
+With no outlier present the guard changes nothing: flags equal the
+independent oracle and tables are byte-identical with the guard on and off
+(tested), and Silver tables are byte-identical to `main`'s (apart from the
+new `_silver_watermark_guarded` field) for the DE-03 all-scenario stream
+ingested before or after the data, a 2027-simulated stream at a 2026 clock,
+two Bronze runs five months apart, and DE-04 history with a clock before or
+after it (checked through the real CLIs for this change). Regression tests:
+`test_silver_watermark_guard.py` (rule, sequencer, configuration,
+`arrival_time_skew`) and `test_silver_watermark_guard_qa.py` (every QA D1
+scenario against the oracle, incl. the real CLI chain).
 
 ### Enrichment and standardisation (clean table)
 
@@ -1517,8 +1588,10 @@ unknown vehicle is not a section 12 rule). Then lineage (`ingestion_time`,
 `silver_run_id`, `processing_time`, `ingestion_time`, `source`,
 `bronze_run_id`, `_bronze_source_file`, `_bronze_line_number`,
 `_silver_arrival_seq`, `primary_rule`, `rejection_category`,
-`rejection_rules`, `rejections`, `event_id` (when it is a string), and the raw
-payload:
+`rejection_rules`, `rejections`, `event_id` (when it is a string),
+`_silver_watermark_guarded` (DE-08: the stream-relative guard's verdict on
+the record's `event_time` when that is usable - parseable and inside the
+timestamp bounds - else null; see "Watermark guard"), and the raw payload:
 
 | `raw_format` | `raw_payload` | `raw_payload_text` / `raw_encoding` |
 |---|---|---|
@@ -1556,18 +1629,22 @@ are scoped to the run, so consumers (DE-07) read one committed Silver run.
 
 ### Run manifest and PROJECT.md section 15 counters
 
-`_runs/<id>.json` (sorted keys): `run_id`, `status`, `processing_time`,
+`_runs/<id>.json` (sorted keys): `silver_manifest_version` (`1.1.0` since
+DE-08, which added `config.watermark_guard` / `config.arrival_time_skew`, the
+DE-08 `validation_thresholds` keys, `service_area` and the guard counters -
+fields Gold requires; `1.0.0` before), `run_id`, `status`, `processing_time`,
 `started_at`/`ended_at`/`duration_seconds`, `input_fingerprint`,
 `previous_attempts` (failed attempts of this run_id - the FU-03 audit trail,
 kept from the start in Silver), `bronze_table`, `bronze_selection`
 (`all_committed`/`explicit`), `bronze_runs_consumed` (with
 `bronze_to_silver_latency_seconds` = processing_time - Bronze
-ingestion_time), `config` (incl. `watermark_guard`), `validation_thresholds`,
+ingestion_time), `config` (incl. `watermark_guard`, `arrival_time_skew`), `validation_thresholds`,
 `service_area` (DE-01 box, margin, enabled), `reference_sha256`,
 `rule_catalogue` (every rule id above, in precedence order, with category,
 section 12 mapping and description), `tables` (path, sha256, records),
-`event_time` (lateness, reference, watermark guard, min/max event_time,
-final watermark), `reconciliation`, `removed_uncommitted_paths`, `error`, and
+`event_time` (lateness, reference, watermark guard, arrival_time_skew,
+`max_buffered_records`, min/max event_time - the max over events that
+advanced the watermark - and final watermark), `reconciliation`, `removed_uncommitted_paths`, `error`, and
 `counters`:
 
 | Counter | Meaning |
@@ -1578,7 +1655,8 @@ final watermark), `reconciliation`, `removed_uncommitted_paths`, `error`, and
 | `duplicates_excluded` | valid repeats excluded (section 15 "duplicates") |
 | `duplicate_payload_conflicts` | duplicates whose payload differed from the kept copy |
 | `in_order` / `out_of_order` / `late` | event-time status of `valid_loaded` (section 15 "late events") |
-| `watermark_guarded` | clean records loaded with `_silver_watermark_guarded = true` (`flag` mode only; a flag on loaded data, like `late`) |
+| `watermark_guarded` | clean records the watermark guard held back (`_silver_watermark_guarded = true`; a flag on loaded data, like `late`) |
+| `quarantined_watermark_guarded` | quarantine records whose usable `event_time` the guard would hold back (`_silver_watermark_guarded = true`; Gold does not attribute them) |
 | `parse_errors` / `schema_failures` / `rule_failures` | quarantined, by primary-rule category (section 12 "schema-failure counts") |
 | `quarantined_by_rule` | quarantined, by primary rule (sums to `quarantined`) |
 | `rule_violations` | every rule hit (a record can hit several) |
@@ -1633,11 +1711,29 @@ Validated by `simulator/silver/config.py` (pydantic, unknown keys rejected):
 alphabet), `allowed_lateness_seconds`, `future_time_reference`
 (`generated_at`/`ingestion_time`), `max_logged_rejections` (caps per-record
 warning log lines; every rejection is still counted and written), and the
-required `[silver.watermark_guard]` table (`mode`, `reference`,
-`max_skew_seconds`; DE-08). Section 12 thresholds - including the DE-08
-delay, service-area and timestamp bounds - stay in DE-01's
+required DE-08 tables `[silver.watermark_guard]` (`mode`,
+`max_jump_seconds`, `lookahead_events`, `min_corroborating_vehicles`,
+`min_contradicting_vehicles`) and `[silver.arrival_time_skew]` (`mode`,
+`reference`, `max_skew_seconds`). Section 12 thresholds - including the
+DE-08 delay, service-area and timestamp bounds - stay in DE-01's
 `default_validation.toml`; an alternate `--validation-config` must define
 them too (no silent defaults).
+
+**Upgrading to DE-08 (custom configs and existing Silver runs).**
+- A custom `--validation-config` written before DE-08 fails to load until it
+  adds `min_delay_seconds`, `max_delay_seconds`, `require_service_area`,
+  `service_area_margin_degrees`, `min_timestamp` and `max_timestamp`
+  (defaults and meaning in `simulator/config/default_validation.toml`).
+- A custom `--silver-config` written before DE-08 fails to load until it adds
+  `[silver.watermark_guard]` (`mode`, `max_jump_seconds`, `lookahead_events`,
+  `min_corroborating_vehicles`, `min_contradicting_vehicles`) and
+  `[silver.arrival_time_skew]` (`mode`, `reference`, `max_skew_seconds`)
+  (copy them from `simulator/silver/default_silver.toml`).
+- Silver runs committed before DE-08 (`silver_manifest_version` `1.0.0`)
+  stay readable, and do not block Gold for other runs, but Gold refuses to
+  aggregate one ("Re-run Silver ... under a new --run-id"): re-run Silver
+  with the current code (a new run id, since the input fingerprint changes)
+  before running Gold.
 
 ### Mapping to Fabric
 
@@ -1649,7 +1745,7 @@ is active (ADR-0004):
 | Read committed Bronze runs via manifests | Read the `bronze_telemetry_stream` Delta table (only committed transactions are visible); incremental runs via Delta change data feed or Structured Streaming with a checkpoint. |
 | Strict `TelemetryEvent` validation + rule mapping | `from_json` with an explicit schema + `columnNameOfCorruptRecord`, then one boolean column per rule and an array column of failed rule ids, in a PySpark notebook. |
 | Validate-then-dedup, first arrival wins | Split valid/invalid, then `dropDuplicates(["event_id"])` (or `dropDuplicatesWithinWatermark`) on the valid stream; in batch, `row_number()` over `event_id` ordered by ingestion time and source position. |
-| Watermark guard (DE-08) | A per-row predicate `event_time <= ingestion_time + max_skew` evaluated **before** `withWatermark` (Spark's watermark is the max event time seen, so one far-future row would otherwise move it for the whole stream); failing rows go to quarantine. |
+| Watermark guard (DE-08) | Spark's own `withWatermark` is the max event time seen, so one far-future row would move it for the whole stream; the guard must run **before** it. In batch: `lead`/`collect_list` over a window ordered by arrival (`rowsBetween(1, lookahead_events)`) gives each row its lookahead evidence, then the running max that skips held-back rows is a sequential scan (`applyInPandas` over the ordered rows). In Structured Streaming: a single-key `applyInPandasWithState` holding the running max and the pending buffer (rows released once decided), emitting `_silver_watermark_guarded`, followed by `withWatermark` on rows that were not held back. The opt-in `arrival_time_skew` rule is a plain per-row predicate. |
 | Event-time watermark, late flagged | `withWatermark("event_time", "60 seconds")` for stateful windows. Spark silently drops late rows inside stateful operators, which section 12 forbids, so late rows are flagged (compare with the max event_time per micro-batch in `foreachBatch`) or routed to a late table before aggregation. Eventhouse/KQL equivalent: `ingestion_time()` vs event time. |
 | Quarantine JSONL | `silver_telemetry_quarantine` Delta table (raw `value` column kept), appended in the same job. |
 | Duplicates audit JSONL | `silver_telemetry_duplicates` Delta table, or counts only in the run-audit table. |
@@ -1659,12 +1755,12 @@ is active (ADR-0004):
 
 ### DE-06 tests
 
-`pytest simulator -q` includes 233 Silver tests (136 before DE-08):
+`pytest simulator -q` includes 301 Silver tests (136 before DE-08):
 
 - `test_silver_rules.py` - a negative and a positive (boundary) case for every
   section 12 rule and the extra rules (DE-08 rules included; `service_area`
-  and `watermark_guard` cases are validated exactly as `run_silver` does,
-  with the DE-01 service area and the default guard); configurability of every threshold via
+  and `arrival_time_skew` cases are validated exactly as `run_silver` does,
+  with the DE-01 service area and the opt-in rule switched on); configurability of every threshold via
   DE-01 `ValidationThresholds`; future-time reference behaviour; all failing
   rules recorded in precedence order; every DE-01 reason mapped, an unmapped
   one fails loudly.
@@ -1704,7 +1800,8 @@ is active (ADR-0004):
 - `test_silver_value_bounds.py` (DE-08, FU-08/FU-10) - `delay_range`
   (`10**30`, `-10**30`, int64 edges, values exactly at and one past each
   bound, configurability); `service_area` (`(0, 0)`, a point at, just inside
-  and just outside each of the four edges, margin and on/off configurability,
+  and just outside each of the four edges - computed and as the literal
+  documented values -34.10/-33.50/150.50/151.40 (QA D2) - margin and on/off configurability,
   DE-03 `invalid_coordinates` keeping `valid_coordinates` as primary,
   precedence); `timestamp_bounds` (`9999-12-31`, `0001-01-01`, a year-1
   `+14:00` instant that used to crash Silver, both fields, inclusive bounds,
@@ -1713,16 +1810,31 @@ is active (ADR-0004):
   `event_time` within bounds); new rules in the manifest `rule_catalogue`.
 - `test_silver_watermark_guard.py` (DE-08, FU-06) - the QA reproduction as a
   regression test: one far-future (2090, inside the bounds) event in a 1,000
-  event DE-03 stream leaves every other event's late/out-of-order flag equal
-  to the independently computed outlier-free baseline, in `quarantine` and
-  `flag` mode; `off` reproduces the poisoning; with no outlier every mode is
-  byte-identical to the default and to the oracle; boundary against
-  ingestion time; configurable reference and skew; replays; manifest and
-  fingerprint; config validation.
+  event DE-03 stream is loaded, flagged and leaves every other event's
+  late/out-of-order flag equal to the independently computed outlier-free
+  baseline; `off` reproduces the poisoning; with no outlier both modes are
+  byte-identical to the default and to the oracle; the quarantined-record
+  verdict; the single-vehicle ambiguity keeps the unguarded result; the
+  decision rule (corroboration, contradiction, exact `max_jump` boundary,
+  lookahead limit, early decisions, end of input); the sequencer (arrival
+  order kept, a corroborated jump with a straggler classified exactly as
+  without the guard); manifest, fingerprint and config validation (incl.
+  pre-DE-08 configs refused); the opt-in `arrival_time_skew` rule (off by
+  default, boundary, reference, skew, replays).
+- `test_silver_watermark_guard_qa.py` (DE-08, QA D1 of PR #16) - every QA
+  scenario against the oracle with the default config: one outlier 1 day /
+  1 month / 2026-06-01 / 2090 ahead of a 2025 stream, at positions 0, 25 and
+  500, at a 2026 ingestion clock and at a clock before the data; two
+  outliers from distinct vehicles; a vehicle whose clock runs a day fast;
+  a 2027-simulated stream at a 2026 clock; a fixed ingestion time before
+  the data; DE-04 history ingested before it; no-outlier identity (guard on
+  = off = oracle) incl. two Bronze runs five months apart; and (a) and (e)
+  through the real incidents -> Bronze -> Silver CLIs.
 - `test_silver_false_positives.py` (DE-08 criterion 4) - with defaults the
-  new rules quarantine nothing in 3,000 DE-02 baseline events, 3,000 DE-03
-  congestion + breakdown events, and the full default DE-04
-  `historical_telemetry` (15,033 rows), each through Bronze -> Silver.
+  new rules quarantine nothing, and the guard holds back nothing, in 3,000
+  DE-02 baseline events, 3,000 DE-03 congestion + breakdown events, and the
+  full default DE-04 `historical_telemetry` (15,033 rows), each through
+  Bronze -> Silver.
 
 ### Known limitations (DE-06)
 
@@ -1744,14 +1856,15 @@ is active (ADR-0004):
 - **Resolved (DE-08, FU-10): no absolute event-time bounds** (rule
   `timestamp_bounds`).
 - **Resolved (DE-08, FU-06): a far-future valid event could move the
-  watermark** (watermark guard). Limitation: the guard compares an event with
-  its arrival, so it cannot catch an outlier that is ahead of the rest of
-  the stream but still behind its own arrival time - e.g. in a historical
-  backfill ingested weeks later, an event mis-dated by two hours would still
-  advance the watermark by two hours. A stream-relative guard (maximum jump
-  of the watermark) was not chosen because it needs confirmation logic to
-  tell an outlier from a genuine gap (e.g. the next service day) and could
-  otherwise quarantine a whole day of valid data.
+  watermark** (stream-relative watermark guard; the first, clock-relative
+  version was rejected in QA D1 of PR #16 and survives only as the opt-in
+  `arrival_time_skew` rule). Limitations, detailed under "Watermark guard":
+  outliers less than `max_jump_seconds` (15 min) ahead are not caught; more
+  than `min_corroborating_vehicles` clustered outliers from distinct
+  vehicles corroborate each other; an outlier with fewer than
+  `min_contradicting_vehicles` vehicles after it (end of input,
+  single-vehicle streams) is accepted; decisions wait for up to
+  `lookahead_events` later events (a bounded buffer).
 - **Resolved (FU-05): DE-03 duplicate injection used to replace the event it
   fired on**, so that event could be missing from the stream or first arrive
   later as a "replay". DE-03 now delivers each duplicate as an extra copy
@@ -1836,10 +1949,18 @@ inconsistent store is not silently worked around.
 
 **DE-08 event-time settings.** Gold also reads, from the selected Silver
 manifest, the `validation_thresholds` and the `config.future_time_reference`
-/ `config.watermark_guard` that Silver run applied, and re-applies those
-event-time rules during attribution (below). A Silver manifest written before
-DE-08 lacks them, so Gold refuses it with `GoldInputError` ("re-run Silver")
-instead of guessing (fail closed). As a contract check, a clean record whose
+/ `config.arrival_time_skew` that Silver run applied, and re-applies those
+stateless event-time rules during attribution (below). It does **not**
+re-apply the stream-relative watermark guard (stream state that a
+quarantined record never entered): it uses the `_silver_watermark_guarded`
+verdict Silver recorded on each record. The selected run must have
+`silver_manifest_version` `1.1.0`; an older (pre-DE-08) one is refused with a
+short `GoldInputError` ("... has silver_manifest_version '1.0.0'; Gold needs
+'1.1.0' ... Re-run Silver with the current code under a new --run-id"), and
+a 1.1.0 manifest missing these settings is refused likewise ("re-run
+Silver"), instead of guessing (fail closed). A pre-DE-08 run elsewhere in the
+store passes the structural checks and does not block other runs. As a
+contract check, a clean record whose
 `event_time` lies outside the recorded `min_timestamp`/`max_timestamp` also
 fails the run with `GoldInputError`, so no Gold row can have a period outside
 the configured bounds.
@@ -1923,10 +2044,19 @@ applies:
 | 3 | (DE-08, FU-11) Silver did not reject its `schema_version` (`supported_schema_version` not in `rejection_rules`): under an unknown schema no field, route and time included, has a defined meaning. | `schema_version_unsupported` |
 | 4 | `route_id` is a string naming a DE-01 reference route. An unknown route has no row of its own, because a Warehouse fact row would have no `dim_route` member. | `route_id_missing_or_unknown` |
 | 5 | `event_time` is an ISO-8601 string with a UTC offset (Silver's `parsable_timestamps` check). | `event_time_unparseable` |
-| 6 | Silver did not reject the record under an **event-time rule** - `timestamp_bounds`, `future_time_tolerance` or `watermark_guard` (DE-08; before it only `future_time_tolerance`) - since that time would place it in the wrong period. | `event_time_rejected` |
-| 7 | (DE-08, FU-10/FU-11) Gold's **re-check** of those rules passes. Silver evaluates stage-2 rules only for records that pass stage 1, so e.g. a negative speed with a far-future `event_time` carried only `non_negative_speed` and used to be attributed to that future bucket. Gold re-applies, with the thresholds and settings **recorded in the consumed Silver manifest**: `timestamp_bounds` to `event_time` and (when parseable) `generated_at`; `future_time_tolerance` against `generated_at` or the record's `ingestion_time` (Silver `future_time_reference`); `watermark_guard` against the record's `ingestion_time`/`processing_time`, only when Silver ran it in `quarantine` mode. The rule code is shared with Silver (`simulator.schemas.telemetry.timestamp_bounds_reasons` / `future_time_reason`, `simulator.silver.rules.WatermarkGuard`). | `event_time_rejected_on_recheck` |
+| 6 | Silver did not reject the record under an **event-time rule** - `timestamp_bounds`, `future_time_tolerance` or the opt-in `arrival_time_skew` (DE-08; before it only `future_time_tolerance`) - since that time would place it in the wrong period. | `event_time_rejected` |
+| 7 | (DE-08, FU-10/FU-11) Gold's **re-check** of those stateless rules passes. Silver evaluates stage-2 rules only for records that pass stage 1, so e.g. a negative speed with a `9999` or far-from-`generated_at` `event_time` carried only `non_negative_speed` and used to be attributed to that bucket. Gold re-applies, with the thresholds and settings **recorded in the consumed Silver manifest**: `timestamp_bounds` to `event_time` and (when parseable) `generated_at`; `future_time_tolerance` against `generated_at` or the record's `ingestion_time` (Silver `future_time_reference`); `arrival_time_skew` against the record's `ingestion_time`/`processing_time`, only when Silver ran it (`mode = "quarantine"`; off by default). The rule code is shared with Silver (`simulator.schemas.telemetry.timestamp_bounds_reasons` / `future_time_reason`, `simulator.silver.rules.ArrivalTimeSkew`). | `event_time_rejected_on_recheck` |
 | 8 | (DE-08) The re-check's reference instant is usable - e.g. under the default `generated_at` reference, a record whose `generated_at` is missing or unparseable cannot be checked, so it is not placed. | `event_time_unverifiable` |
-| 9 | Its bucket is representable (defensive: with the validated bounds every in-bounds instant is). | `event_time_unparseable` |
+| 9 | (DE-08, FU-06) Silver's stream-relative **watermark guard** did not hold the record's `event_time` back (`_silver_watermark_guarded` is not `true` on the quarantine record). The guard is stream state, so Gold does not - and cannot - re-apply it to a quarantined record; it uses the verdict Silver recorded (e.g. a negative-speed record dated a day ahead of the stream is not placed in that future bucket). | `event_time_held_back_by_watermark_guard` |
+| 10 | Its bucket is representable (defensive: with the validated bounds every in-bounds instant is). | `event_time_unparseable` |
+
+**Held-back clean records.** A clean record the guard held back
+(`_silver_watermark_guarded = true`) is a valid observation, so - like a
+late row - it is counted in its own period's `event_count` (the identity
+`sum(event_count) == silver.valid_loaded` is kept); a consumer that wants to
+exclude it filters on Silver's flag. Gold counts such records as
+`counters.watermark_guarded_event_count` and checks it against Silver's
+`watermark_guarded` (reconciliation check `watermark_guarded_equals_silver`).
 
 So a record with a null `vehicle_id`, an invalid coordinate or a negative
 speed, but an intact route and a trustworthy time, lowers that route's
@@ -1936,7 +2066,9 @@ it in Silver (a stage-2 reject such as `max_speed`) gives the same answer, so
 Gold re-checks every candidate without needing to know which stage rejected
 it. The settings used are recorded in the Gold manifest as `attribution`
 (`event_time_rules`, `rechecked_rules`, `min_timestamp`, `max_timestamp`,
-`future_time_tolerance_seconds`, `future_time_reference`, `watermark_guard`).
+`future_time_tolerance_seconds`, `future_time_reference`, `arrival_time_skew`,
+and `watermark_guard` = Silver's guard config plus a note that Gold does not
+re-apply it).
 With the bounds enforced in Silver (clean) and here (quarantine), no Gold row
 has a period outside `[min_timestamp, max_timestamp]` (tested). Run totals are in the manifest: `quarantined_attributed`,
 `quarantined_unattributed`, `unattributed_by_reason`, and
@@ -1961,6 +2093,7 @@ sum(unattributed_by_reason)                       == quarantined_unattributed
 sum(rows.late_event_count)                        == silver.late
 sum(rows.out_of_order_event_count)                == silver.out_of_order
 sum(rows.sum_delay_seconds)                       == sum(delay_seconds) over clean records read
+watermark_guarded_event_count                     == silver.watermark_guarded   (DE-08)
 silver.extracted == silver.valid_loaded + silver.quarantined + silver.duplicates_excluded
 overall_valid_percentage                          == silver.quality_percentage
 lines in the JSONL (and CSV, minus header)        == number of rows
@@ -2033,7 +2166,7 @@ once the Fabric trial is active (ADR-0002, ADR-0004):
 
 ### DE-07 tests
 
-`pytest simulator -q` includes 111 Gold tests (69 before DE-08):
+`pytest simulator -q` includes 120 Gold tests (69 before DE-08):
 
 - `test_gold_aggregate.py`: the **hand-computed fixture**. A 17-line stream
   (clean, late, duplicate with a conflicting payload, every unattributed
@@ -2065,21 +2198,27 @@ once the Fabric trial is active (ADR-0002, ADR-0004):
   slowest route. A second Gold process produces byte-identical output.
 - `test_gold_cli.py`: exit codes and the summary line, the no-op rerun,
   missing input, unknown Silver run, run-id conflict, alternate config and
-  an invalid run id; a clean record in an unrepresentable period (since
-  DE-08 planted by re-signed tampering, because Silver now quarantines it)
-  fails through the JSON contract.
+  an invalid run id; a clean record outside the Silver timestamp bounds
+  (since DE-08 planted by re-signed tampering, because Silver now
+  quarantines it) fails Gold's bounds contract check through the JSON
+  contract.
 - `test_gold_attribution_hardening.py` (DE-08, FU-10/FU-11): a second
   **hand-computed fixture** (10 lines: unsupported schema version; negative
   speed with year-0001, year-9999, far-future-vs-generated_at and 2090
-  times; valid year-9999 and 2090 events; an unparseable `generated_at`)
-  with expected unattributed reasons and rows worked out by hand; no row
-  period outside the bounds; the QA year-0001 case; `attribution` in the
-  manifest; a pre-DE-08 Silver manifest refused; the fail-closed note
-  (a bad manifest blocks even a pinned Gold run); the Bronze -> Silver ->
-  Gold CLI chain byte-identical across two process runs; and every new
-  branch of the attribution rule (each Silver event-time rule, each re-check,
-  guard modes and references, both future-time references, unverifiable
-  references, precedence), plus the clean-record bounds contract check.
+  times; valid year-9999 and 2090 events; an unparseable `generated_at`),
+  run with the opt-in `arrival_time_skew` rule on, with expected unattributed
+  reasons and rows worked out by hand; no row period outside the bounds; the
+  QA year-0001 case; `attribution` in the manifest; a pre-DE-08 (1.0.0)
+  Silver manifest refused with the exact short message, and a 1.1.0 one
+  missing settings refused without a raw validation dump; the fail-closed
+  note (a bad manifest blocks even a pinned Gold run); the Bronze -> Silver
+  -> Gold CLI chain byte-identical across two process runs; every branch of
+  the attribution rule (each Silver event-time rule, each re-check,
+  `arrival_time_skew` on/off and references, both future-time references,
+  unverifiable references, Silver's watermark-guard verdict, precedence);
+  the clean-record bounds contract check; and, with the default config, a
+  stream with a held-back clean outlier (counted in its period, reconciled
+  with Silver) and a held-back quarantined outlier (not attributed).
 
 ### Known limitations (DE-07)
 
@@ -2094,10 +2233,12 @@ once the Fabric trial is active (ADR-0002, ADR-0004):
   WARNING log) but does not correct it. It should be fixed in Silver before
   the Data Quality page uses these numbers.
 - **Late flags inherit Silver's watermark.** `late_event_count` is
-  Silver's flag. The FU-06 far-future outlier is now stopped by Silver's
-  watermark guard (DE-08); the guard's own limitation (an outlier still
-  behind its arrival time) is listed under DE-06. Late flags never change
-  `event_count` or averages, because late rows are included either way.
+  Silver's flag. The FU-06 outlier is now held back by Silver's
+  stream-relative watermark guard (DE-08), so it no longer flags later rows
+  late; the guard's own limitations are listed under DE-06. A held-back
+  clean outlier is still counted in its own (possibly far-future, but
+  in-bounds) period. Late flags never change `event_count` or averages,
+  because late rows are included either way.
 - **Resolved (DE-08, FU-11): attribution saw only the failing Silver
   stage.** Gold now re-applies the event-time rules to every quarantined
   record it would attribute (see "Quarantine attribution"). Only the

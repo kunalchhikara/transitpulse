@@ -40,15 +40,16 @@ def test_missing_silver_input_exits_1(tmp_path, capsys):
     assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
 
 
-def test_clean_event_in_an_unrepresentable_period_fails_with_the_json_contract(tmp_path, capsys):
+def test_clean_event_outside_the_silver_timestamp_bounds_fails_with_the_json_contract(tmp_path, capsys):
     """QA of PR #12 (D1): Silver loaded an event dated 9999-12-31T20:00Z as
-    clean, but its +10 local bucket overflows datetime. Gold must fail
-    through its documented FAILED summary line, not an uncaught traceback.
-
-    Since DE-08 (FU-10) Silver quarantines such an event (`timestamp_bounds`),
-    so the clean record is planted by editing the committed clean file and
-    re-signing its sha256 in the Silver manifest: Gold's own contract check
-    must still fail the run cleanly."""
+    clean, and its +10 local bucket overflowed datetime. Since DE-08 (FU-10)
+    Silver quarantines such an event (`timestamp_bounds`), so the clean record
+    is planted by editing the committed clean file and re-signing its sha256
+    in the Silver manifest. What this now exercises is Gold's clean-record
+    BOUNDS contract check (the event_time is outside the bounds recorded in
+    the Silver manifest, which is checked before any period is computed): it
+    must fail the run through the documented FAILED summary line, not an
+    uncaught traceback."""
     far = "9999-12-31T20:00:00.000000Z"
     ok = _event("OK1", "ROUTE-01", "2025-01-01T00:10:00Z", 30)
     result = silver_from_lines(
@@ -66,6 +67,7 @@ def test_clean_event_in_an_unrepresentable_period_fails_with_the_json_contract(t
     code, summary = _main(capsys, tmp_path, "--run-id", "g1")
     assert code == 1 and summary["status"] == "FAILED" and summary["error_type"] == "GoldInputError"
     assert "FAR1" in summary["error"]
+    assert "outside the Silver timestamp bounds" in summary["error"]
     manifest = json.loads((tmp_path / "gold" / "_runs" / "g1.json").read_text())
     assert manifest["status"] == "FAILED"
 

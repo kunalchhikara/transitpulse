@@ -115,6 +115,33 @@ def test_points_at_and_just_inside_or_outside_each_edge(edge, nudge, valid):
     assert _rules(payload) == ([] if valid else ["service_area"])
 
 
+#: QA D2 (PR #16): the edges exactly as documented (README rule 6: box
+#: -34.05..-33.55 / 150.55..151.35 + 0.05), as literals - NOT computed as
+#: box +/- margin, which is how the float error hid from the edge tests above.
+DOCUMENTED_EDGES = {"south": ("latitude", -34.10, -1), "north": ("latitude", -33.50, +1),
+                    "west": ("longitude", 150.50, -1), "east": ("longitude", 151.40, +1)}
+
+
+def test_documented_defaults_are_the_literal_edges():
+    assert (BOX.min_latitude, BOX.max_latitude, BOX.min_longitude, BOX.max_longitude) == (
+        -34.05, -33.55, 150.55, 151.35)
+    assert MARGIN == 0.05
+    assert BOX.min_latitude - MARGIN != -34.10  # the floating-point trap D2 is about
+
+
+@pytest.mark.parametrize("edge", sorted(DOCUMENTED_EDGES))
+def test_literal_documented_edges_are_inclusive(edge):
+    field, boundary, outward = DOCUMENTED_EDGES[edge]
+    assert _rules(valid_payload(**{**CENTRE, field: boundary})) == []
+    assert _rules(valid_payload(**{**CENTRE, field: boundary + outward * 1e-6})) == ["service_area"]
+    assert _rules(valid_payload(**{**CENTRE, field: boundary - outward * 1e-6})) == []
+
+
+def test_literal_documented_south_edge_loads_through_silver(tmp_path):
+    result = lines_to_silver(tmp_path, [json.dumps(valid_payload(**{**CENTRE, "latitude": -34.10}))])
+    assert result.manifest["counters"]["valid_loaded"] == 1
+
+
 def test_service_area_margin_is_configurable():
     just_outside_box = valid_payload(**{**CENTRE, "latitude": BOX.min_latitude - 0.01})
     assert _rules(just_outside_box) == []  # inside the default 0.05 degree margin
@@ -247,14 +274,15 @@ def test_every_clean_event_time_is_within_the_bounds(tmp_path):
     lines = [json.dumps(valid_payload(event_id=f"EVT-{i}", event_time=t, generated_at=t))
              for i, t in enumerate(instants)]
     result = lines_to_silver(tmp_path, lines)
-    # Only the in-bounds instants could load (the 2100 one is also > the
-    # ingestion time, so the FU-06 guard quarantines it - checked separately).
+    # Only the in-bounds instants load - both edges included (the 2100-01-01
+    # one is ahead of the ingestion clock, which no longer matters: the
+    # watermark guard is stream-relative, QA D1).
     for record in table(result, "clean"):
         event_time = datetime.fromisoformat(record["event_time"])
         assert THRESHOLDS.min_timestamp <= event_time <= THRESHOLDS.max_timestamp
     by_rule = result.manifest["counters"]["quarantined_by_rule"]
     assert by_rule["timestamp_bounds"] == 3
-    assert result.manifest["counters"]["valid_loaded"] == 2
+    assert result.manifest["counters"]["valid_loaded"] == 3
 
 
 def test_manifest_rule_catalogue_lists_the_new_rules_in_precedence_order(tmp_path):
@@ -264,7 +292,7 @@ def test_manifest_rule_catalogue_lists_the_new_rules_in_precedence_order(tmp_pat
         "bronze_parse_error", "supported_schema_version", "required_fields", "parsable_timestamps",
         "schema_conformance", "valid_coordinates", "service_area", "non_negative_speed", "max_speed",
         "non_negative_occupancy", "max_occupancy", "heading_range", "delay_range", "known_route",
-        "timestamp_bounds", "future_time_tolerance", "watermark_guard",
+        "timestamp_bounds", "future_time_tolerance", "arrival_time_skew",
     ]
     counters = result.manifest["counters"]
     assert set(rules) == set(counters["quarantined_by_rule"]) == set(counters["rule_violations"])
