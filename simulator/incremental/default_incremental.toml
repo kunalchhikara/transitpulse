@@ -1,0 +1,95 @@
+# Default DE-11 incremental batch loader configuration
+# (simulator/incremental/config.py). Every operational knob lives here, per
+# PROJECT.md section 19. Point `--config` (or `load_incremental_config(path)`)
+# at a copy to change behaviour. Relative paths resolve against the current
+# working directory (like DE-04/DE-05); keep them relative so Bronze run
+# manifests record relative input paths too.
+
+[incremental]
+# Control (watermark) store, immutable per-attempt audit records and the
+# per-window extract directories handed to Bronze. Under the gitignored
+# simulator/_out/.
+state_dir = "simulator/_out/incremental"
+# DE-04 batch source: `<dataset>.jsonl` + `manifest.json`
+# (`python -m simulator.batch --output-dir simulator/_out/batch`).
+batch_source_dir = "simulator/_out/batch"
+# DE-01 reference entities: `<entity>.json` JSON arrays
+# (`python -m simulator.reference --output-dir simulator/_out/reference`).
+reference_source_dir = "simulator/_out/reference"
+# Root of the DE-05 Bronze store the extracts are landed in.
+bronze_output_dir = "simulator/_out/bronze"
+# Optional alternate DE-05 Bronze config (default: Bronze's bundled one).
+# Its parse_error_policy is overridden from `bad_source_policy` below.
+# bronze_config = "path/to/bronze.toml"
+
+# What to do with a source line that is malformed (not UTF-8, not JSON, not a
+# JSON object, duplicate keys) or whose watermark column is missing/unparseable
+# (incremental), or a reference element that is not an object or has no
+# schema_version (full). Never skipped silently:
+#   "strict"   - the dataset fails before anything is landed; its watermark is
+#                unchanged (default: a broken source is a source incident).
+#   "preserve" - the line is landed byte-for-byte once (Bronze stores a
+#                parse-error record, or a stored record that DE-12 Silver
+#                quarantines) and counted in the audit record.
+bad_source_policy = "strict"
+# Compare each DE-04 source file with its manifest.json (sha256 + row_count)
+# before extracting; a mismatch fails the dataset (no watermark change).
+verify_source_manifest = true
+# Name of the DE-04 control file in batch_source_dir.
+source_manifest_file = "manifest.json"
+# What to do when the number of source rows at or below a dataset's current
+# watermark differs from what was recorded when that watermark was set
+# (rows appeared "behind" the watermark, or vanished):
+#   "fail"   - the dataset fails loudly, watermark unchanged (default).
+#   "record" - count it in the audit record, log a warning and continue (the
+#              late rows are NOT extracted).
+late_arrival_policy = "fail"
+# Bronze run-id prefixes (deterministic run id = prefix-dataset-window).
+incremental_run_id_prefix = "inc"
+full_run_id_prefix = "full"
+# Append every DATASET_CATALOGUE dataset not listed in [[incremental.datasets]]
+# (catalogue order, incremental mode), so a new DE-04 dataset is picked up
+# without a config change.
+include_unlisted_catalogue_datasets = true
+# Catalogue datasets never loaded (e.g. ["weather_observations"]).
+exclude_datasets = []
+
+[incremental.retry]
+# Attempts per dataset per pipeline run (1 = no retry). Only transient errors
+# (TimeoutError, ConnectionError, simulator.incremental.TransientError) are
+# retried; every other failure fails the dataset at once.
+max_attempts = 3
+# Backoff before retry n (n >= 1): min(max, initial * multiplier ** (n - 1)).
+initial_backoff_seconds = 2.0
+backoff_multiplier = 2.0
+max_backoff_seconds = 30.0
+
+# Processing order and load mode. `full`: a DE-01 reference entity reloaded in
+# full from `reference_source_dir/source_file` (needs `source_file` and
+# `primary_key`). `incremental`: a DE-04 DATASET_CATALOGUE dataset loaded by
+# its catalogue watermark column (primary key/watermark come from the
+# catalogue). Order is processing order only - no cross-dataset dependency is
+# enforced (FU-02); a failed dataset never blocks the others.
+[[incremental.datasets]]
+name = "depots"
+mode = "full"
+source_file = "depots.json"
+primary_key = ["depot_id"]
+
+[[incremental.datasets]]
+name = "stops"
+mode = "full"
+source_file = "stops.json"
+primary_key = ["stop_id"]
+
+[[incremental.datasets]]
+name = "routes"
+mode = "full"
+source_file = "routes.json"
+primary_key = ["route_id"]
+
+[[incremental.datasets]]
+name = "vehicles"
+mode = "full"
+source_file = "vehicles.json"
+primary_key = ["vehicle_id"]
