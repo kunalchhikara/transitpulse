@@ -177,6 +177,14 @@ def test_batch_retry_history_two_source_manifest_failures(tmp_path):
     assert result.status == "COMMITTED"
     assert result.manifest["previous_attempts"] == [expected_entry(f) for f in failed]
     assert [h["error"]["type"] for h in result.manifest["previous_attempts"]] == ["SourceManifestError"] * 2
+    # QA of PR #15 (D2): counting had finished before the mismatch was
+    # detected, so each failed attempt keeps its counts.
+    for h in result.manifest["previous_attempts"]:
+        assert h["totals"] is not None
+        assert accounting_identity_holds(h["totals"])
+    assert result.manifest["previous_attempts"][1]["totals"]["records_read"] == (
+        result.manifest["totals"]["records_read"] + 1
+    )
     assert accounting_identity_holds(result.manifest["totals"])
     clean = ingest_batch(SAMPLE_BATCH_DIR, run_id="b1", output_dir=tmp_path / "clean", clock=same_time_as(result))
     assert result.manifest["totals"] == clean.manifest["totals"]

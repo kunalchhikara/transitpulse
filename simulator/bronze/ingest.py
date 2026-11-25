@@ -263,9 +263,12 @@ class PathRedactor:
     """Replaces known absolute local roots inside free text (exception
     messages) with placeholders before the text is persisted: the Bronze
     store root -> `<bronze_root>`, input directories -> `<input_dir>`, the
-    home directory -> `~`. Each root is matched as given, absolute and
-    resolved (e.g. macOS `/var` -> `/private/var`), longest first, and only
-    at a path-component boundary."""
+    home directory -> `~`. Each root is matched as given (including a
+    relative spelling such as the default `simulator/_out/bronze`, since OS
+    errors quote paths exactly as passed), absolute and resolved (e.g. macOS
+    `/var` -> `/private/var`), longest first, and only at path-component
+    boundaries (a relative form must also start at a boundary, so `out` never
+    matches inside `timeout/`)."""
 
     def __init__(self, store_root: Path, input_dirs: Sequence[Path] = ()) -> None:
         forms: dict[str, str] = {}
@@ -278,15 +281,20 @@ class PathRedactor:
                 candidates |= {str(path.absolute()), str(path.resolve())}
             for form in candidates:
                 form = form.rstrip("\\/")
-                if form and os.path.isabs(form):
+                if form and form not in {".", ".."}:
                     forms.setdefault(form, label)
 
         for directory in input_dirs:
             add(directory, INPUT_DIR_PLACEHOLDER)
         add(store_root, BRONZE_ROOT_PLACEHOLDER)
         add(_home_dir(), HOME_PLACEHOLDER)
+
+        def pattern(form: str) -> re.Pattern[str]:
+            left = "" if os.path.isabs(form) else r"(?<![\w.~/\\-])"
+            return re.compile(left + re.escape(form) + r"(?![\w.-])")
+
         self._rules = [
-            (re.compile(re.escape(form) + r"(?![\w.-])"), label)
+            (pattern(form), label)
             for form, label in sorted(forms.items(), key=lambda item: len(item[0]), reverse=True)
         ]
 
@@ -501,6 +509,11 @@ def _run(
             for fh in handles.values():
                 fh.close()
 
+        # Counting is complete here; record it before any check that can fail,
+        # so a FAILED attempt (e.g. a source-manifest mismatch) keeps its counts.
+        totals = _sum_counters([s.counters() for s in file_stats])
+        manifest["totals"] = totals
+
         # Source reconciliation against the DE-04 manifest (batch only).
         if source_manifest is None:
             reconciliation = {"status": "NOT_APPLICABLE" if mode == MODE_STREAM else "NO_SOURCE_MANIFEST"}
@@ -538,8 +551,6 @@ def _run(
                 "input_files": [inputs[i].name for i in indexes],
                 **counters,
             }
-        totals = _sum_counters([s.counters() for s in file_stats])
-        manifest["totals"] = totals
         manifest["accounting_identity_holds"] = accounting_identity_holds(totals) and all(
             accounting_identity_holds(s.counters()) for s in file_stats
         )

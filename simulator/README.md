@@ -970,7 +970,7 @@ absolute path, so it can be published as RECORDED evidence as-is:
 | `input_files[].path` | Relative to the file's input directory, i.e. the **basename** (`-` for stdin), whatever form the path was given in (absolute or relative). Declared in the manifest as `input_path_policy: "basename"`. Input directories are not recorded; inputs are identified by name + `sha256` + `size_bytes`. |
 | `tables[].path`, `removed_uncommitted_paths` | Relative to the Bronze store root (unchanged). The store root itself is not recorded. |
 | `source_reconciliation.source_manifest` | The DE-04 manifest's file name (unchanged). |
-| `error.message` (incl. inside `previous_attempts`) | Exception text with the absolute store root replaced by `<bronze_root>`, input directories by `<input_dir>` and the home directory by `~` (matched as given, absolute and symlink-resolved). The exception raised to the caller keeps the full text. |
+| `error.message` (incl. inside `previous_attempts`) | Exception text with the store root replaced by `<bronze_root>`, input directories by `<input_dir>` and the home directory by `~`. Each root is matched as given (including a relative spelling, since OS errors quote paths exactly as passed), absolute and symlink-resolved, only at path-component boundaries. The exception raised to the caller keeps the full text. |
 
 Consequently the same input content + run_id + fixed clock gives a
 byte-identical manifest wherever the input lives (tested across two CLI

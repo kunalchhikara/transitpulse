@@ -99,6 +99,44 @@ def test_committed_sample_under_repo_root_records_no_repo_path(tmp_path):
     assert path_leaks(m, *_roots(tmp_path), SAMPLE_BATCH_DIR) == []
 
 
+def test_relative_store_root_is_redacted_in_failed_error(tmp_path, monkeypatch):
+    """QA of PR #15 (D1): OS errors quote a path exactly as passed, so a
+    relative store root (e.g. `<username>/work/store`) must be redacted too."""
+    user_dir = tmp_path / "secret-user" / "work"
+    user_dir.mkdir(parents=True)
+    src = write_lines(user_dir / "e.ndjson", clean_stream_lines(4))
+    monkeypatch.chdir(tmp_path)
+    out = Path("secret-user/work/store")
+    assert not out.is_absolute()
+
+    def denied(self, table, run_id):
+        raise PermissionError(13, "Permission denied", str(self.partition_dir(table, run_id)))
+
+    monkeypatch.setattr(BronzeStore, "publish_table", denied)
+    with pytest.raises(PermissionError) as raised:
+        ingest_stream([src], run_id="r1", output_dir=out, clock=FIXED_CLOCK)
+    assert "secret-user/work/store" in str(raised.value)  # caller still sees it
+    failed = BronzeStore(tmp_path / out).read_manifest("r1")
+    assert "secret-user" not in json.dumps(failed)
+    assert f"<bronze_root>/{TABLE}/run_id=r1" in failed["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("open('out/_staging/x')", "open('<bronze_root>/_staging/x')"),
+        ("out", "<bronze_root>"),
+        ("timeout/ and layout/out2 and ./outside", "timeout/ and layout/out2 and ./outside"),
+        ("dir/out/x", "dir/out/x"),
+    ],
+)
+def test_relative_root_only_matches_at_path_boundaries(text, expected, tmp_path, monkeypatch):
+    from simulator.bronze.ingest import PathRedactor
+
+    monkeypatch.chdir(tmp_path)
+    assert PathRedactor(Path("out"))(text) == expected
+
+
 def test_relative_inputs_are_recorded_as_basename_too(tmp_path, monkeypatch):
     (tmp_path / "nested" / "dir").mkdir(parents=True)
     write_lines(tmp_path / "nested" / "dir" / "e.ndjson", clean_stream_lines(3))
