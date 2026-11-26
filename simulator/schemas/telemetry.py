@@ -24,7 +24,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from simulator.config.models import ValidationThresholds
+from simulator.config.models import BoundingBox, ValidationThresholds
 
 #: The schema_version newly-generated TelemetryEvents are stamped with.
 CURRENT_SCHEMA_VERSION = "1.0.0"
@@ -83,12 +83,71 @@ class TelemetryEvent(BaseModel):
     status: VehicleStatus
 
 
+def _as_utc_aware(value: datetime) -> datetime:
+    """Naive values are taken as UTC (DE-01 convention, unchanged)."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def timestamp_bounds_reasons(thresholds: ValidationThresholds, **timestamps: datetime) -> list[str]:
+    """DE-08 / FU-10: one reason per named timestamp outside the inclusive
+    [`min_timestamp`, `max_timestamp`] bounds, in argument order. Shared by
+    `validate_against_thresholds` and Gold's attribution re-check, so the rule
+    has one implementation."""
+    return [
+        f"{name} outside configured timestamp bounds"
+        for name, value in timestamps.items()
+        if not thresholds.min_timestamp <= _as_utc_aware(value) <= thresholds.max_timestamp
+    ]
+
+
+def future_time_reason(event_time: datetime, thresholds: ValidationThresholds, now: datetime) -> str | None:
+    """The future-time-tolerance reason if `event_time` is later than `now` +
+    `future_time_tolerance_seconds`, else None. A reference so close to
+    `datetime.max` that adding the tolerance overflows cannot be exceeded."""
+    try:
+        limit = _as_utc_aware(now) + timedelta(seconds=thresholds.future_time_tolerance_seconds)
+    except OverflowError:
+        return None
+    if _as_utc_aware(event_time) > limit:
+        return "event_time is beyond the future-time tolerance"
+    return None
+
+
+#: Decimal places the expanded service-area edges are rounded to (1e-9 deg is
+#: ~0.1 mm): `-34.05 - 0.05` is -34.099999999999994 in binary floating point,
+#: which would reject the documented edge -34.10 despite "edges inclusive".
+SERVICE_AREA_EDGE_DECIMALS = 9
+
+
+def service_area_edges(area: BoundingBox, margin_degrees: float) -> tuple[float, float, float, float]:
+    """(min_lat, max_lat, min_lon, max_lon) of `area` expanded by
+    `margin_degrees`, each rounded to `SERVICE_AREA_EDGE_DECIMALS`."""
+    return tuple(
+        round(value, SERVICE_AREA_EDGE_DECIMALS)
+        for value in (
+            area.min_latitude - margin_degrees,
+            area.max_latitude + margin_degrees,
+            area.min_longitude - margin_degrees,
+            area.max_longitude + margin_degrees,
+        )
+    )
+
+
+def in_service_area(latitude: float, longitude: float, area: BoundingBox, margin_degrees: float) -> bool:
+    """DE-08 / FU-08: inside `area` expanded by `margin_degrees` on every side
+    (edges inclusive, as the decimal values written in config: see
+    `SERVICE_AREA_EDGE_DECIMALS`)."""
+    min_lat, max_lat, min_lon, max_lon = service_area_edges(area, margin_degrees)
+    return min_lat <= latitude <= max_lat and min_lon <= longitude <= max_lon
+
+
 def validate_against_thresholds(
     event: TelemetryEvent,
     thresholds: ValidationThresholds,
     *,
     known_route_ids: set[str] | None = None,
     now: datetime | None = None,
+    service_area: BoundingBox | None = None,
 ) -> list[str]:
     """Apply the configurable PROJECT.md section 12 business rules.
 
@@ -98,11 +157,24 @@ def validate_against_thresholds(
     quarantined by a Silver-layer rule (e.g. speed over the configured
     ceiling, unknown route, unsupported schema version, timestamp too far in
     the future).
+
+    DE-08 added (backward compatible - existing reasons and arguments are
+    unchanged): `delay_seconds` bounds and absolute `event_time` /
+    `generated_at` bounds (always applied), and the service-area check,
+    applied only when the caller passes `service_area` (DE-01's
+    `ScaleConfig.sydney_bounding_box`) and `thresholds.require_service_area`.
     """
     reasons: list[str] = []
 
     if event.schema_version not in thresholds.supported_schema_versions:
         reasons.append(f"unsupported schema_version '{event.schema_version}'")
+
+    if (
+        service_area is not None
+        and thresholds.require_service_area
+        and not in_service_area(event.latitude, event.longitude, service_area, thresholds.service_area_margin_degrees)
+    ):
+        reasons.append("position outside the configured service area")
 
     if event.speed_kmh < thresholds.min_speed_kmh:
         reasons.append("speed_kmh below configured minimum")
@@ -119,6 +191,11 @@ def validate_against_thresholds(
     if event.heading > thresholds.max_heading_degrees:
         reasons.append("heading exceeds configured maximum")
 
+    if event.delay_seconds < thresholds.min_delay_seconds:
+        reasons.append("delay_seconds below configured minimum")
+    if event.delay_seconds > thresholds.max_delay_seconds:
+        reasons.append("delay_seconds exceeds configured maximum")
+
     if (
         thresholds.require_known_route
         and known_route_ids is not None
@@ -126,12 +203,13 @@ def validate_against_thresholds(
     ):
         reasons.append(f"unknown route_id '{event.route_id}'")
 
+    reasons.extend(
+        timestamp_bounds_reasons(thresholds, event_time=event.event_time, generated_at=event.generated_at)
+    )
+
     reference_now = now if now is not None else datetime.now(UTC)
-    tolerance = timedelta(seconds=thresholds.future_time_tolerance_seconds)
-    event_time = event.event_time
-    if event_time.tzinfo is None:
-        event_time = event_time.replace(tzinfo=UTC)
-    if event_time > reference_now + tolerance:
-        reasons.append("event_time is beyond the future-time tolerance")
+    future = future_time_reason(event.event_time, thresholds, reference_now)
+    if future is not None:
+        reasons.append(future)
 
     return reasons

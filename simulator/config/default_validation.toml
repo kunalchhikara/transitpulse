@@ -14,6 +14,28 @@ min_heading_degrees = 0.0
 max_heading_degrees = 359.9
 future_time_tolerance_seconds = 120
 require_known_route = true
+
+# DE-08 / BACKLOG FU-08: inclusive delay_seconds bounds (rule delay_range).
+# A bus more than an hour early, or more than a service day late, is a data
+# error, not a delay; the bounds also keep the value well inside int64 for
+# Delta/Warehouse (10**30 used to load as clean). Observed on valid simulator
+# output: DE-02/DE-03 -30..420 s, DE-04 historical -102..3259 s.
+min_delay_seconds = -3600
+max_delay_seconds = 86400
+
+# DE-08 / BACKLOG FU-08: service-area GPS rule (rule service_area). The area
+# is DE-01's [sydney_bounding_box] in default_scale.toml (not repeated here),
+# expanded by service_area_margin_degrees on every side (0.05 deg ~ 5.5 km,
+# GPS/edge-of-network tolerance). (0, 0) "null island" is rejected.
+require_service_area = true
+service_area_margin_degrees = 0.05
+
+# DE-08 / BACKLOG FU-10: inclusive absolute bounds on event_time AND
+# generated_at (rule timestamp_bounds). Must carry a UTC offset. Anything
+# outside is not a plausible reading for this platform (e.g. 9999-12-31 or
+# 0001-01-01); the bounds also keep every accepted instant representable.
+min_timestamp = 2000-01-01T00:00:00Z
+max_timestamp = 2100-01-01T00:00:00Z
 supported_schema_versions = ["1.0.0"]
 required_fields = [
     "event_id",

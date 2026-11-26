@@ -14,6 +14,7 @@ Warehouse or OneLake resource is read or written. See `simulator/README.md`
 from simulator.gold.aggregate import (
     COLUMNS,
     UNATTRIBUTED_REASONS,
+    EventTimeCheck,
     Periods,
     aggregate_route_performance,
     attribute_quarantined,
@@ -37,6 +38,7 @@ __all__ = [
     "COLUMNS",
     "RECONCILIATION_IDENTITIES",
     "UNATTRIBUTED_REASONS",
+    "EventTimeCheck",
     "GoldAccountingError",
     "GoldConfig",
     "GoldError",

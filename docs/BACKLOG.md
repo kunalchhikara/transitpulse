@@ -389,3 +389,17 @@ note prevents overclaiming, handover.
   parent directory doesn't exist, instead of a structured refusal (exit 2).
   Low priority; check the other CLIs for the same behaviour. Source: QA of
   PR #17 (O-3).
+- **FU-13: Make the Silver watermark-guard buffer linear.** While a guard
+  decision is pending, rejected and duplicate records are buffered too and
+  each new record rescans the pending buffer (`EventTimeSequencer` in
+  `simulator/silver/watermark.py`), so cost grows quadratically with rejects
+  behind an open decision (QA: 60k unparseable lines after one outlier took
+  73 s vs 2.2 s guard-off). Count pending valid events incrementally and cap
+  or document buffered rejects. **Gate:** before any large-volume run or the
+  PySpark/Fabric port. Source: QA retest of PR #16 (D3).
+- **FU-14: Per-row "held back" indicator in Gold.** A watermark-guarded
+  (held-back) clean outlier is counted in its own Gold period, but Gold rows
+  carry no per-row guarded count, so a dashboard can't tell that a lone row
+  (e.g. 2090-01-01) is a held-back outlier. Add `watermark_guarded_event_count`
+  per row or a Gold option to exclude guarded rows. **Gate:** before DE-07
+  route-performance rows feed a dashboard. Source: QA retest of PR #16.

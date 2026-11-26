@@ -30,7 +30,7 @@ import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -56,7 +56,7 @@ from simulator.bronze.store import (
 from simulator.config.loader import load_scale_config, load_validation_thresholds
 from simulator.config.models import ScaleConfig, ValidationThresholds
 from simulator.reference.generator import ReferenceDataset, generate_reference_dataset
-from simulator.schemas.telemetry import TelemetryEvent
+from simulator.schemas.telemetry import TelemetryEvent, timestamp_bounds_reasons
 from simulator.silver.bronze_reader import BronzeRow, BronzeRun, iter_rows, select_runs
 from simulator.silver.config import (
     FutureTimeReference,
@@ -70,19 +70,28 @@ from simulator.silver.rules import (
     CATEGORY_SCHEMA,
     RULE_CATALOGUE,
     RULE_IDS,
+    ArrivalTimeSkew,
     TelemetryValidator,
     Violation,
     parse_error_violation,
+    parse_timestamp,
+)
+from simulator.silver.watermark import (
+    IN_ORDER,
+    LATE,
+    OUT_OF_ORDER,
+    EventTimeDecision,
+    EventTimeSequencer,
+    EventTimeTracker,
+    WatermarkGuard,
 )
 
 LOGGER_NAME = "simulator.silver"
-SILVER_MANIFEST_VERSION = "1.0.0"
+#: 1.1.0 (DE-08): + `config.watermark_guard` / `config.arrival_time_skew`,
+#: `validation_thresholds` delay/service-area/timestamp bounds, `service_area`,
+#: `counters.watermark_guarded` - fields Gold requires.
+SILVER_MANIFEST_VERSION = "1.1.0"
 STATUS_ALREADY_COMMITTED = "ALREADY_COMMITTED"
-
-#: `_silver_event_time_status` values of a clean record.
-IN_ORDER = "in_order"
-OUT_OF_ORDER = "out_of_order"
-LATE = "late"
 
 #: Asserted in code before commit; recorded verbatim in every manifest.
 RECONCILIATION_IDENTITIES: tuple[str, ...] = (
@@ -168,44 +177,6 @@ def strict_json_problems(value: Any) -> list[str]:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
-# -- event time ----------------------------------------------------------------
-
-
-class EventTimeTracker:
-    """Per-record event-time watermark over valid, first-seen events in
-    arrival order: `watermark = max(event_time seen) - allowed_lateness`.
-
-    * event_time >= max seen               -> in_order
-    * watermark <= event_time < max seen   -> out_of_order (within lateness)
-    * event_time < watermark               -> late
-    Only events that pass validation and dedup advance the maximum (a
-    corrupt future timestamp must not make everything after it "late")."""
-
-    def __init__(self, allowed_lateness_seconds: int) -> None:
-        self.allowed_lateness = timedelta(seconds=allowed_lateness_seconds)
-        self.max_event_time: datetime | None = None
-        self.min_event_time: datetime | None = None
-
-    @property
-    def watermark(self) -> datetime | None:
-        return None if self.max_event_time is None else self.max_event_time - self.allowed_lateness
-
-    def observe(self, event_time: datetime) -> tuple[str, float, datetime | None]:
-        """Classify `event_time`, then advance. Returns (status,
-        lateness_seconds behind the max seen so far, watermark at arrival)."""
-        watermark = self.watermark
-        if self.max_event_time is None or event_time >= self.max_event_time:
-            status, lateness = IN_ORDER, 0.0
-        else:
-            lateness = (self.max_event_time - event_time).total_seconds()
-            status = LATE if event_time < watermark else OUT_OF_ORDER
-        if self.max_event_time is None or event_time > self.max_event_time:
-            self.max_event_time = event_time
-        if self.min_event_time is None or event_time < self.min_event_time:
-            self.min_event_time = event_time
-        return status, lateness, watermark
 
 
 # -- record builders -----------------------------------------------------------
@@ -297,14 +268,28 @@ def _reference_fingerprint(reference: ReferenceDataset) -> str:
     return hashlib.sha256(reference.to_json(indent=None).encode("utf-8")).hexdigest()
 
 
+def _service_area(scale_config: ScaleConfig, thresholds: ValidationThresholds) -> dict[str, Any]:
+    """What the DE-08 `service_area` rule checks against (manifest record)."""
+    return {
+        "bounding_box": scale_config.sydney_bounding_box.model_dump(mode="json"),
+        "margin_degrees": thresholds.service_area_margin_degrees,
+        "enabled": thresholds.require_service_area,
+    }
+
+
 def _fingerprint(
-    config: SilverConfig, thresholds: ValidationThresholds, reference_sha: str, runs: Sequence[BronzeRun]
+    config: SilverConfig,
+    thresholds: ValidationThresholds,
+    reference_sha: str,
+    runs: Sequence[BronzeRun],
+    service_area: dict[str, Any],
 ) -> str:
     return _sha256_json(
         {
             "silver": config.fingerprint_fields(),
             "thresholds": thresholds.model_dump(mode="json"),
             "reference_sha256": reference_sha,
+            "service_area": service_area,
             "bronze_runs": [[run.run_id, run.sha256] for run in runs],
         }
     )
@@ -345,7 +330,8 @@ def run_silver(
     bronze = BronzeStore(Path(bronze_dir) if bronze_dir is not None else config.bronze_dir)
     runs = select_runs(bronze, config.bronze_table, bronze_run_ids)
     selection = "all_committed" if bronze_run_ids is None else "explicit"
-    fingerprint = _fingerprint(config, thresholds, reference_sha, runs)
+    service_area = _service_area(scale_config, thresholds)
+    fingerprint = _fingerprint(config, thresholds, reference_sha, runs, service_area)
 
     store = BronzeStore(Path(output_dir) if output_dir is not None else config.output_dir)
     log_ctx = {"silver_run_id": run_id}
@@ -391,6 +377,7 @@ def run_silver(
         ],
         "config": config.fingerprint_fields(),
         "validation_thresholds": thresholds.model_dump(mode="json"),
+        "service_area": service_area,
         "reference_sha256": reference_sha,
         "rule_catalogue": [rule.as_dict() for rule in RULE_CATALOGUE],
         "tables": {},
@@ -429,11 +416,14 @@ def run_silver(
             summary = _process(
                 rows=iter_rows(bronze, runs),
                 ctx=ctx,
+                processing_time=started,
                 config=config,
                 validator=TelemetryValidator(
                     thresholds,
                     (route.route_id for route in reference.routes),
                     use_ingestion_time_reference=config.future_time_reference is FutureTimeReference.INGESTION_TIME,
+                    service_area=scale_config.sydney_bounding_box,
+                    arrival_time_skew=ArrivalTimeSkew.from_config(config.arrival_time_skew),
                 ),
                 reference=reference,
                 write=write,
@@ -501,6 +491,7 @@ def _process(
     *,
     rows,
     ctx: _Context,
+    processing_time: datetime,
     config: SilverConfig,
     validator: TelemetryValidator,
     reference: ReferenceDataset,
@@ -513,13 +504,49 @@ def _process(
     routes = {route.route_id: route for route in reference.routes}
     vehicles = {vehicle.vehicle_id: vehicle for vehicle in reference.vehicles}
     tracker = EventTimeTracker(config.allowed_lateness_seconds)
+    event_time_status: Counter[str] = Counter()
+
+    def emit_other(item: tuple[str, dict[str, Any]]) -> None:
+        write(*item)
+
+    def emit_event(record: dict[str, Any], decision: EventTimeDecision) -> None:
+        event_time_status[decision.status] += 1
+        record["_silver_event_time_status"] = decision.status
+        record["_silver_lateness_seconds"] = decision.lateness_seconds
+        record["_silver_watermark"] = format_timestamp(decision.watermark) if decision.watermark is not None else None
+        record["_silver_watermark_guarded"] = decision.held_back
+        write(clean_table, record)
+
+    def emit_probe(record: dict[str, Any], held_back: bool) -> None:
+        record["_silver_watermark_guarded"] = held_back
+        write(quarantine_table, record)
+
+    # Records are written in arrival order; a record waits only while an
+    # earlier watermark-guard decision needs more of the stream.
+    sequencer = EventTimeSequencer(tracker, WatermarkGuard.from_config(config.watermark_guard), emit_other,
+                                   emit_event, emit_probe)
+    thresholds = validator.thresholds
+
+    def quarantine(record: dict[str, Any]) -> None:
+        """A quarantined record whose event_time is usable (parsable, within
+        the timestamp bounds) gets the guard's verdict for that time in
+        `_silver_watermark_guarded` (Gold does not attribute a held-back one);
+        otherwise null."""
+        record["_silver_watermark_guarded"] = None
+        payload = record.get("raw_payload")
+        if isinstance(payload, dict):
+            event_time = parse_timestamp(payload.get("event_time"))
+            if event_time is not None and not timestamp_bounds_reasons(thresholds, event_time=event_time):
+                vehicle_id = payload.get("vehicle_id")
+                sequencer.probe(record, event_time.astimezone(UTC), vehicle_id if isinstance(vehicle_id, str) else None)
+                return
+        sequencer.other((quarantine_table, record))
 
     buckets = _Buckets()
     quarantined_by_rule: Counter[str] = Counter()
     rule_violations: Counter[str] = Counter()
     by_category: Counter[str] = Counter()
     parse_errors_by_code: Counter[str] = Counter()
-    event_time_status: Counter[str] = Counter()
     enrichment_misses: Counter[str] = Counter()
     seen: dict[str, dict[str, Any]] = {}
     logged = 0
@@ -537,6 +564,7 @@ def _process(
                 strip_metadata(row.record),
                 row.original_text,
                 ingestion_time=_parse_utc(row.record[INGESTION_TIME]),
+                processing_time=processing_time,
             )
             violations, event = outcome.violations, outcome.event
 
@@ -545,7 +573,7 @@ def _process(
             quarantined_by_rule[violations[0].rule] += 1
             by_category[violations[0].category] += 1
             rule_violations.update(v.rule for v in violations)
-            write(quarantine_table, _quarantine_record(ctx, row, seq, violations))
+            quarantine(_quarantine_record(ctx, row, seq, violations))
             if logged < config.max_logged_rejections:
                 logged += 1
                 log.warning(
@@ -568,7 +596,7 @@ def _process(
             matches = kept["payload_sha256"] == payload_sha
             if not matches:
                 buckets.duplicate_payload_conflicts += 1
-            write(
+            sequencer.other((
                 duplicates_table,
                 {
                     "silver_run_id": ctx.silver_run_id,
@@ -580,7 +608,7 @@ def _process(
                     "payload_matches_kept": matches,
                     "kept": {k: kept[k] for k in kept if k != "payload_sha256"},
                 },
-            )
+            ))
             continue
 
         lineage = row.lineage()
@@ -591,8 +619,6 @@ def _process(
             "_silver_arrival_seq": seq,
             "payload_sha256": payload_sha,
         }
-        status, lateness, watermark = tracker.observe(event.event_time.astimezone(UTC))
-        event_time_status[status] += 1
         route = routes.get(event.route_id)
         vehicle = vehicles.get(event.vehicle_id)
         if route is None:
@@ -600,8 +626,7 @@ def _process(
         if vehicle is None:
             enrichment_misses["vehicle_not_in_reference"] += 1
         buckets.valid_loaded += 1
-        write(
-            clean_table,
+        sequencer.event(
             {
                 **_standardised_event(event),
                 "ref_route_number": route.route_number if route else None,
@@ -611,12 +636,17 @@ def _process(
                 "silver_run_id": ctx.silver_run_id,
                 "processing_time": ctx.processing_time,
                 "_silver_arrival_seq": seq,
-                "_silver_event_time_status": status,
-                "_silver_lateness_seconds": lateness,
-                "_silver_watermark": format_timestamp(watermark) if watermark is not None else None,
+                # Filled in by emit_event once the event-time decision is final.
+                "_silver_event_time_status": None,
+                "_silver_lateness_seconds": None,
+                "_silver_watermark": None,
+                "_silver_watermark_guarded": None,
             },
+            event.event_time.astimezone(UTC),
+            event.vehicle_id,
         )
 
+    sequencer.finish()
     denominator = buckets.valid_loaded + buckets.quarantined
     counters: dict[str, Any] = {
         "extracted": buckets.extracted,
@@ -627,6 +657,8 @@ def _process(
         "in_order": event_time_status[IN_ORDER],
         "out_of_order": event_time_status[OUT_OF_ORDER],
         "late": event_time_status[LATE],
+        "watermark_guarded": sequencer.held_back,
+        "quarantined_watermark_guarded": sequencer.probes_held_back,
         "parse_errors": by_category[CATEGORY_PARSE],
         "schema_failures": by_category[CATEGORY_SCHEMA],
         "rule_failures": by_category[CATEGORY_RULE],
@@ -644,6 +676,12 @@ def _process(
     event_time = {
         "allowed_lateness_seconds": config.allowed_lateness_seconds,
         "future_time_reference": config.future_time_reference.value,
+        "watermark_guard": config.watermark_guard.model_dump(mode="json"),
+        "arrival_time_skew": config.arrival_time_skew.model_dump(mode="json"),
+        # Peak number of records held in arrival order while a guard decision
+        # waited for later events (bounded by lookahead_events valid events
+        # plus interleaved rejects/duplicates).
+        "max_buffered_records": sequencer.max_buffered,
         "min_event_time": format_timestamp(tracker.min_event_time) if tracker.min_event_time else None,
         "max_event_time": format_timestamp(tracker.max_event_time) if tracker.max_event_time else None,
         "final_watermark": format_timestamp(tracker.watermark) if tracker.watermark else None,

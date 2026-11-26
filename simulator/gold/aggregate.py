@@ -36,9 +36,25 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from simulator.bronze.ingest import format_timestamp
+from simulator.config.models import ValidationThresholds
 from simulator.gold.errors import GoldInputError
-from simulator.silver.pipeline import IN_ORDER, LATE, OUT_OF_ORDER
-from simulator.silver.rules import FUTURE_TIME_TOLERANCE, timestamp_problem
+from simulator.schemas.telemetry import future_time_reason, timestamp_bounds_reasons
+from simulator.silver.config import (
+    ArrivalTimeSkewConfig,
+    FutureTimeReference,
+    WatermarkGuardConfig,
+)
+from simulator.silver.pipeline import SILVER_MANIFEST_VERSION
+from simulator.silver.rules import ARRIVAL_TIME_SKEW as SILVER_ARRIVAL_TIME_SKEW
+from simulator.silver.rules import EVENT_TIME_RULES as SILVER_EVENT_TIME_RULES
+from simulator.silver.rules import (
+    FUTURE_TIME_TOLERANCE,
+    SUPPORTED_SCHEMA_VERSION,
+    TIMESTAMP_BOUNDS,
+    ArrivalTimeSkew,
+    timestamp_problem,
+)
+from simulator.silver.watermark import IN_ORDER, LATE, OUT_OF_ORDER
 
 #: Rounding of `avg_delay_seconds` / `valid_percentage` (Silver rounds its
 #: `quality_percentage` to the same 4 dp, so the two are comparable).
@@ -51,20 +67,149 @@ _DATETIME = TypeAdapter(datetime)
 #: in the precedence order they are evaluated.
 UNATTRIBUTED_BRONZE_PARSE_ERROR = "bronze_parse_error"  # no JSON object at all
 UNATTRIBUTED_PAYLOAD_UNAVAILABLE = "raw_payload_unavailable"  # parsed payload omitted by Silver (inf / lone surrogate)
+#: DE-08 / FU-11: Silver rejected the schema_version, so no field has a defined meaning.
+UNATTRIBUTED_SCHEMA_VERSION = "schema_version_unsupported"
 UNATTRIBUTED_ROUTE_UNKNOWN = "route_id_missing_or_unknown"  # absent, null, not a string, or not a reference route
 UNATTRIBUTED_EVENT_TIME_UNPARSEABLE = "event_time_unparseable"  # absent / not offset ISO-8601 / out of range
-UNATTRIBUTED_EVENT_TIME_REJECTED = "event_time_rejected"  # parseable, but Silver rejected it (future_time_tolerance)
+#: Silver rejected the record under an event-time rule (`EVENT_TIME_RULES`).
+UNATTRIBUTED_EVENT_TIME_REJECTED = "event_time_rejected"
+#: DE-08 / FU-10, FU-11: Silver never evaluated its stage-2 event-time rules
+#: (the record failed stage 1), and Gold's re-check of them fails.
+UNATTRIBUTED_EVENT_TIME_RECHECK = "event_time_rejected_on_recheck"
+#: DE-08: the re-check needs a reference instant the record does not carry in
+#: usable form (e.g. an unparseable generated_at under the generated_at reference).
+UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE = "event_time_unverifiable"
+#: DE-08 / FU-06: Silver's stream-relative watermark guard recorded this
+#: record's event_time as an uncorroborated jump ahead of the stream
+#: (`_silver_watermark_guarded = true` on the quarantine record). Gold uses
+#: Silver's verdict; it does not (cannot) re-derive stream state.
+UNATTRIBUTED_EVENT_TIME_HELD_BACK = "event_time_held_back_by_watermark_guard"
 UNATTRIBUTED_REASONS: tuple[str, ...] = (
     UNATTRIBUTED_BRONZE_PARSE_ERROR,
     UNATTRIBUTED_PAYLOAD_UNAVAILABLE,
+    UNATTRIBUTED_SCHEMA_VERSION,
     UNATTRIBUTED_ROUTE_UNKNOWN,
     UNATTRIBUTED_EVENT_TIME_UNPARSEABLE,
     UNATTRIBUTED_EVENT_TIME_REJECTED,
+    UNATTRIBUTED_EVENT_TIME_RECHECK,
+    UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE,
+    UNATTRIBUTED_EVENT_TIME_HELD_BACK,
 )
 
-#: Silver rules whose failure means the record's event_time itself is wrong,
-#: so it must not place the record in a period.
-EVENT_TIME_RULES = frozenset({FUTURE_TIME_TOLERANCE})
+#: Silver rules whose failure means the record's event_time itself cannot be
+#: trusted, so it must not place the record in a period (`timestamp_bounds`,
+#: `future_time_tolerance`, and the opt-in `arrival_time_skew`).
+EVENT_TIME_RULES = frozenset(SILVER_EVENT_TIME_RULES)
+
+#: What Gold records (manifest `attribution.watermark_guard.gold`) about the
+#: Silver FU-06 watermark guard: it is stream state, so Gold does not re-apply
+#: it; it uses the flag Silver recorded.
+WATERMARK_GUARD_NOTE = (
+    "stream-relative and stateful in Silver, so not re-applied by Gold. It never quarantines: Silver loads a "
+    "held-back event with _silver_watermark_guarded = true, and Gold counts it in its period like any clean "
+    "record (counters.watermark_guarded_event_count, reconciled with Silver's watermark_guarded)."
+)
+
+
+@dataclass(frozen=True)
+class EventTimeCheck:
+    """DE-08: the stateless Silver event-time rules, re-applied by Gold to
+    quarantined records before attributing them (Silver evaluates its stage-2
+    rules only for records that pass stage 1, so e.g. a negative speed with a
+    far-future event_time carries only `non_negative_speed`). Built from the
+    settings the consumed Silver run RECORDED in its manifest, so Gold applies
+    exactly the rules that Silver run applied:
+
+    * `timestamp_bounds` on event_time and (when parseable) generated_at;
+    * `future_time_tolerance` against generated_at or the record's Bronze
+      ingestion_time (Silver `future_time_reference`);
+    * `arrival_time_skew` against the record's ingestion_time /
+      processing_time, only when Silver ran it (`mode = "quarantine"`).
+
+    The FU-06 watermark guard is NOT re-applied: it is stream-relative state
+    that a quarantined record never entered, so Gold uses the
+    `_silver_watermark_guarded` flag Silver recorded on clean records."""
+
+    thresholds: ValidationThresholds
+    future_time_reference: FutureTimeReference
+    arrival_time_skew: ArrivalTimeSkew
+    silver_watermark_guard: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_silver_manifest(cls, manifest: Mapping[str, Any]) -> EventTimeCheck:
+        run_id = manifest.get("run_id")
+        version = manifest.get("silver_manifest_version")
+        if version != SILVER_MANIFEST_VERSION:
+            raise GoldInputError(
+                f"Silver run {run_id!r} has silver_manifest_version {version!r}; Gold needs "
+                f"{SILVER_MANIFEST_VERSION!r} (DE-08 event-time settings). Re-run Silver with the current code "
+                "under a new --run-id, then run Gold on it"
+            )
+        try:
+            config = manifest["config"]
+            thresholds = ValidationThresholds.model_validate(manifest["validation_thresholds"])
+            future = FutureTimeReference(config["future_time_reference"])
+            skew = ArrivalTimeSkew.from_config(ArrivalTimeSkewConfig.model_validate(config["arrival_time_skew"]))
+            guard = WatermarkGuardConfig.model_validate(config["watermark_guard"]).model_dump(mode="json")
+        except (KeyError, TypeError, ValueError) as exc:  # pydantic ValidationError is a ValueError
+            raise GoldInputError(
+                f"Silver run {run_id!r}: its manifest does not record valid DE-08 event-time settings "
+                "(validation_thresholds; config.future_time_reference, arrival_time_skew, watermark_guard); "
+                "re-run Silver with the current code"
+            ) from exc
+        return cls(thresholds, future, skew, guard)
+
+    @property
+    def rechecked_rules(self) -> tuple[str, ...]:
+        skew = (SILVER_ARRIVAL_TIME_SKEW,) if self.arrival_time_skew.enabled else ()
+        return (TIMESTAMP_BOUNDS, FUTURE_TIME_TOLERANCE, *skew)
+
+    def within_bounds(self, instant: datetime) -> bool:
+        return not timestamp_bounds_reasons(self.thresholds, instant=instant)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Recorded in the Gold manifest (`attribution`)."""
+        dumped = self.thresholds.model_dump(mode="json")
+        return {
+            "event_time_rules": list(SILVER_EVENT_TIME_RULES),
+            "rechecked_rules": list(self.rechecked_rules),
+            "min_timestamp": dumped["min_timestamp"],
+            "max_timestamp": dumped["max_timestamp"],
+            "future_time_tolerance_seconds": self.thresholds.future_time_tolerance_seconds,
+            "future_time_reference": self.future_time_reference.value,
+            "arrival_time_skew": {
+                "mode": self.arrival_time_skew.mode.value,
+                "reference": self.arrival_time_skew.reference.value,
+                "max_skew_seconds": self.arrival_time_skew.max_skew_seconds,
+            },
+            "watermark_guard": {"silver_config": self.silver_watermark_guard, "gold": WATERMARK_GUARD_NOTE},
+        }
+
+    def recheck(self, payload: Mapping[str, Any], record: Mapping[str, Any], event_time: datetime) -> str | None:
+        """None if `event_time` passes every re-checked rule; otherwise
+        `UNATTRIBUTED_EVENT_TIME_RECHECK` or `UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE`."""
+        generated_at = _parse_timestamp(payload.get("generated_at"))
+        named = {"event_time": event_time}
+        if generated_at is not None:
+            named["generated_at"] = generated_at
+        if timestamp_bounds_reasons(self.thresholds, **named):
+            return UNATTRIBUTED_EVENT_TIME_RECHECK
+        ingestion_time = _parse_timestamp(record.get("ingestion_time"))
+        reference = generated_at if self.future_time_reference is FutureTimeReference.GENERATED_AT else ingestion_time
+        if reference is None:
+            return UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE
+        if future_time_reason(event_time, self.thresholds, reference) is not None:
+            return UNATTRIBUTED_EVENT_TIME_RECHECK
+        skew = self.arrival_time_skew
+        if skew.enabled:
+            arrival = skew.arrival(ingestion_time=ingestion_time,
+                                   processing_time=_parse_timestamp(record.get("processing_time")))
+            if arrival is None:
+                return UNATTRIBUTED_EVENT_TIME_UNVERIFIABLE
+            if skew.reason(event_time, arrival) is not None:
+                return UNATTRIBUTED_EVENT_TIME_RECHECK
+        return None
+
 
 #: Output columns, in order (JSON lines key order and CSV header).
 COLUMNS: tuple[str, ...] = (
@@ -150,6 +295,9 @@ class Aggregate:
     clean_records: int = 0
     clean_sum_delay_seconds: int = 0
     clean_by_status: dict[str, int] = field(default_factory=dict)
+    #: Clean records Silver's FU-06 watermark guard held back (included in
+    #: their period like any clean record; Silver's flag, not re-derived).
+    clean_watermark_guarded: int = 0
     quarantined_records: int = 0
     quarantined_attributed: int = 0
     unattributed_by_reason: dict[str, int] = field(default_factory=dict)
@@ -159,8 +307,8 @@ class Aggregate:
         return sum(self.unattributed_by_reason.values())
 
 
-def _parse_event_time(value: Any) -> datetime | None:
-    """A Silver-strict event_time (ISO-8601 string with a UTC offset, same
+def _parse_timestamp(value: Any) -> datetime | None:
+    """A Silver-strict timestamp (ISO-8601 string with a UTC offset, same
     check as Silver rule `parsable_timestamps`), or None."""
     if timestamp_problem(value) is not None:
         return None
@@ -171,32 +319,48 @@ def _parse_event_time(value: Any) -> datetime | None:
 
 
 def attribute_quarantined(
-    record: Mapping[str, Any], known_route_ids: frozenset[str], periods: Periods
+    record: Mapping[str, Any],
+    known_route_ids: frozenset[str],
+    periods: Periods,
+    *,
+    event_time_check: EventTimeCheck | None = None,
 ) -> tuple[str, datetime] | str:
     """(route_id, period start) for a quarantined Silver record whose
     route_id and event_time are both usable; otherwise the
     `UNATTRIBUTED_*` reason (first that applies, in `UNATTRIBUTED_REASONS`
     order). Usable means: the record is a JSON object Silver kept in parsed
-    form, `route_id` is a DE-01 reference route, `event_time` is an
-    offset-carrying ISO-8601 timestamp, and Silver did not reject the record
-    *because of* its event_time."""
+    form under a supported schema_version, `route_id` is a DE-01 reference
+    route, `event_time` is an offset-carrying ISO-8601 timestamp, Silver did
+    not reject the record under an event-time rule, it passes Gold's re-check
+    of those rules (`event_time_check`; `run_gold` always passes one), Silver's
+    stream-relative watermark guard did not hold its event_time back
+    (`_silver_watermark_guarded`), and its bucket is representable."""
     if record.get("raw_format") == "bronze_parse_error":
         return UNATTRIBUTED_BRONZE_PARSE_ERROR
     payload = record.get("raw_payload")
     if not isinstance(payload, dict):
         return UNATTRIBUTED_PAYLOAD_UNAVAILABLE
+    rules = record.get("rejection_rules") or ()
+    if SUPPORTED_SCHEMA_VERSION in rules:
+        return UNATTRIBUTED_SCHEMA_VERSION
     route_id = payload.get("route_id")
     if not isinstance(route_id, str) or route_id not in known_route_ids:
         return UNATTRIBUTED_ROUTE_UNKNOWN
-    event_time = _parse_event_time(payload.get("event_time"))
+    event_time = _parse_timestamp(payload.get("event_time"))
     if event_time is None:
         return UNATTRIBUTED_EVENT_TIME_UNPARSEABLE
+    if EVENT_TIME_RULES.intersection(rules):
+        return UNATTRIBUTED_EVENT_TIME_REJECTED
+    if event_time_check is not None:
+        problem = event_time_check.recheck(payload, record, event_time)
+        if problem is not None:
+            return problem
+    if record.get("_silver_watermark_guarded") is True:
+        return UNATTRIBUTED_EVENT_TIME_HELD_BACK
     try:
         start = periods.start_of(event_time)
     except (OverflowError, ValueError):
         return UNATTRIBUTED_EVENT_TIME_UNPARSEABLE
-    if EVENT_TIME_RULES.intersection(record.get("rejection_rules") or ()):
-        return UNATTRIBUTED_EVENT_TIME_REJECTED
     return route_id, start
 
 
@@ -229,10 +393,14 @@ def aggregate_route_performance(
     periods: Periods,
     reference_routes: Mapping[str, tuple[str, str]],
     lineage: Mapping[str, Any],
+    event_time_check: EventTimeCheck | None = None,
 ) -> Aggregate:
     """Build the route-performance rows. `reference_routes` maps DE-01
     route_id -> (route_number, name); `lineage` holds `gold_run_id`,
-    `silver_run_id` and `processing_time`, copied onto every row.
+    `silver_run_id` and `processing_time`, copied onto every row;
+    `event_time_check` (from the Silver manifest) drives quarantine
+    attribution and, as a contract check, every clean event_time must lie
+    within its timestamp bounds.
 
     Rows are ordered by (period_start, route_id); every (route, period) with
     at least one clean or attributed quarantined record gets a row."""
@@ -243,6 +411,11 @@ def aggregate_route_performance(
 
     for record in clean:
         route_id, event_time, delay, status = _clean_fields(record)
+        if event_time_check is not None and not event_time_check.within_bounds(event_time):
+            raise GoldInputError(
+                f"Silver clean record {record.get('event_id')!r}: event_time {record.get('event_time')!r} is "
+                "outside the Silver timestamp bounds recorded in its manifest (breaks the Silver clean contract)"
+            )
         try:
             period_start = periods.start_of(event_time)
         except OverflowError as exc:
@@ -260,6 +433,7 @@ def aggregate_route_performance(
         result.clean_records += 1
         result.clean_sum_delay_seconds += delay
         result.clean_by_status[status] += 1
+        result.clean_watermark_guarded += record.get("_silver_watermark_guarded") is True
         label = (record.get("ref_route_number"), record.get("ref_route_name"))
         if names.setdefault(route_id, label) != label:
             raise GoldInputError(f"Silver clean records disagree on the reference names of route {route_id!r}")
@@ -267,7 +441,7 @@ def aggregate_route_performance(
     known = frozenset(reference_routes)
     for record in quarantine:
         result.quarantined_records += 1
-        target = attribute_quarantined(record, known, periods)
+        target = attribute_quarantined(record, known, periods, event_time_check=event_time_check)
         if isinstance(target, str):
             result.unattributed_by_reason[target] += 1
             continue

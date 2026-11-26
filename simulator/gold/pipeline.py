@@ -41,6 +41,7 @@ from simulator.gold.aggregate import (
     DECIMAL_PLACES,
     UNATTRIBUTED_REASONS,
     Aggregate,
+    EventTimeCheck,
     Periods,
     aggregate_route_performance,
 )
@@ -74,8 +75,10 @@ AGGREGATE_DEFINITION: dict[str, str] = {
     "event_count": "Silver clean records of the route with event_time in the period - late and out_of_order "
                    "rows INCLUDED; quarantined and duplicate records are never clean, so never counted",
     "avg_delay_seconds": f"sum_delay_seconds / event_count, rounded to {DECIMAL_PLACES} dp; null if event_count == 0",
-    "quarantined_count": "Silver quarantine records attributed to the route and period (route_id is a reference "
-                         "route, event_time parseable with an offset, and not rejected for its event_time)",
+    "quarantined_count": "Silver quarantine records attributed to the route and period (supported schema_version, "
+                         "route_id is a reference route, event_time parseable with an offset, not rejected by a "
+                         "Silver event-time rule, passing Gold's re-check of those rules with the thresholds "
+                         "recorded in the Silver manifest, and not held back by Silver's watermark guard)",
     "valid_percentage": f"100 * event_count / (event_count + quarantined_count), rounded to {DECIMAL_PLACES} dp; "
                         "duplicates are not in the denominator",
 }
@@ -88,6 +91,7 @@ RECONCILIATION_IDENTITIES: tuple[str, ...] = (
     "sum(unattributed_by_reason) == quarantined_unattributed",
     "sum(rows.late_event_count) == silver.late; sum(rows.out_of_order_event_count) == silver.out_of_order",
     "sum(rows.sum_delay_seconds) == sum(delay_seconds) over clean records read",
+    "watermark_guarded_event_count (clean records read with _silver_watermark_guarded) == silver.watermark_guarded",
     "silver.extracted == silver.valid_loaded + silver.quarantined + silver.duplicates_excluded",
     "overall_valid_percentage == silver.quality_percentage",
     "lines in each written file == number of rows",
@@ -163,6 +167,7 @@ def _counters(agg: Aggregate, silver: SilverRun) -> dict[str, Any]:
         "quarantined_unattributed": agg.quarantined_unattributed,
         "unattributed_by_reason": {reason: agg.unattributed_by_reason[reason] for reason in UNATTRIBUTED_REASONS},
         "clean_records_read": agg.clean_records,
+        "watermark_guarded_event_count": agg.clean_watermark_guarded,
         "clean_sum_delay_seconds": agg.clean_sum_delay_seconds,
         "quarantine_records_read": agg.quarantined_records,
         "duplicates_excluded": silver.counters["duplicates_excluded"],
@@ -190,6 +195,7 @@ def reconcile(counters: dict[str, Any], silver: SilverRun, written: dict[str, in
         "late_equals_silver_late": c["late_event_count"] == s[LATE],
         "out_of_order_equals_silver": c["out_of_order_event_count"] == s[OUT_OF_ORDER],
         "delay_sum_preserved": c["sum_delay_seconds"] == c["clean_sum_delay_seconds"],
+        "watermark_guarded_equals_silver": c["watermark_guarded_event_count"] == s.get("watermark_guarded"),
         "silver_identity": s["extracted"] == s["valid_loaded"] + s["quarantined"] + s["duplicates_excluded"],
         "overall_valid_percentage_equals_silver_quality": c["overall_valid_percentage"] == s["quality_percentage"],
         **{f"{name}_lines_on_disk": lines == c["rows"] for name, lines in written.items()},
@@ -238,6 +244,10 @@ def run_gold(
             f"Gold reference data (sha256 {reference_sha}) is not the reference data Silver run "
             f"{silver.run_id!r} used ({silver.manifest.get('reference_sha256')}); pass the same --scale-config"
         )
+    # DE-08: the event-time rules Gold re-applies come from the Silver run's
+    # own manifest (already covered by its input_fingerprint); a Silver run
+    # that predates them is refused rather than guessed at (fail closed).
+    event_time_check = EventTimeCheck.from_silver_manifest(silver.manifest)
     fingerprint = _fingerprint(config, reference_sha, silver)
 
     store = BronzeStore(Path(output_dir) if output_dir is not None else config.output_dir)
@@ -285,6 +295,7 @@ def run_gold(
         "config": config.fingerprint_fields(),
         "reference_sha256": reference_sha,
         "aggregate_definition": AGGREGATE_DEFINITION,
+        "attribution": event_time_check.as_dict(),
         "tables": {},
         "counters": None,
         "reconciliation": None,
@@ -315,6 +326,7 @@ def run_gold(
             periods=Periods(config.period_minutes, config.utc_offset_hours),
             reference_routes={route.route_id: (route.route_number, route.name) for route in reference.routes},
             lineage={"gold_run_id": run_id, "silver_run_id": silver.run_id, "processing_time": processing_time},
+            event_time_check=event_time_check,
         )
         outputs = {PART_FILE_NAME: jsonl_bytes(agg.rows)}
         if config.write_csv:
