@@ -301,12 +301,19 @@ validation only; recorded limitation); DE-05/DE-06 changes; batch Gold.
 **Dependencies:** DE-11 merged; DE-10 merged if its dataset is in the
 catalogue by then.
 **Acceptance criteria:**
-1. Reads Bronze only through committed manifests; keeps a checkpoint of
-   applied Bronze run ids; re-applying one is a no-op.
+1. Reads Bronze only through committed manifests (never by globbing
+   partition directories: after a DE-11 crash recovered at a later
+   `as_of`, an abandoned run's uncommitted partition can remain on disk —
+   QA of PR #17, O-1); keeps a checkpoint of applied Bronze run ids;
+   re-applying one is a no-op.
 2. Bronze parse errors → quarantine with raw bytes recoverable; strict model
    failures (unsupported `schema_version`, missing field, wrong type, bad
    enum, unknown field) → quarantine with named rule ids; validate before
-   dedup.
+   dedup. Rows DE-11 lists in `preserved_bad_rows` with
+   `bronze_outcome = stored_record_requires_quarantine` (missing, null,
+   naive, invalid or non-string `updated_at` stored as ordinary records
+   under the `preserve` policy) MUST be quarantined — test this with a
+   DE-11 `preserve` run.
 3. Per-row merge outcomes: `inserted` (new key); `updated` (newer
    `updated_at`); `unchanged` (same key, same `updated_at`, same payload);
    `stale` (older `updated_at`; excluded and audited); `conflict` (same key,

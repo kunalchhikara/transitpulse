@@ -11,8 +11,9 @@ Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
 (Deterministic Simulator Core Engine), DE-03 (Incident Injection Scenarios in
 Simulator), DE-04 (Synthetic Batch & Historical Datasets), DE-05 (Local
 Bronze Layer Ingestion Logic), DE-06 (Local Silver Layer for the telemetry
-stream) and DE-07 (Local Gold Layer Groundwork - minimal route performance
-aggregate) implemented, all local only (IMPLEMENTED - NOT CONNECTED).
+stream), DE-07 (Local Gold Layer Groundwork - minimal route performance
+aggregate) and DE-11 (Incremental batch extraction with watermark control
+into Bronze) implemented, all local only (IMPLEMENTED - NOT CONNECTED).
 Remaining local work: Silver for the DE-04 batch datasets and the QA
 follow-ups (FU-01..FU-08) in `docs/BACKLOG.md`; the full PROJECT.md section
 10 dimensional model is the later Warehouse story.
@@ -1936,3 +1937,514 @@ once the Fabric trial is active (ADR-0002, ADR-0004):
 - **Fixed UTC offset.** No daylight saving, as in DE-04.
 - **`delay_seconds` is unbounded in Silver (FU-08).** An absurd but valid
   delay is averaged as-is.
+
+## DE-11: Incremental Batch Extraction with Watermark Control into Bronze
+
+**Status: IMPLEMENTED - NOT CONNECTED.** `simulator/incremental/` is local
+Python that reads local files and writes the local Bronze store through the
+DE-05 library. No Fabric Data Factory pipeline, Lakehouse, OneLake or any
+other Azure/Fabric resource has been created, read or written, and nothing
+here is evidence of Fabric execution. "Mapping to Fabric" below records how
+it is meant to carry over.
+
+The loader implements PROJECT.md section 11: it reloads the DE-01 reference
+entities in full, loads the DE-04 transactional datasets incrementally by
+a per-dataset high-watermark on `updated_at` (the maximum `updated_at`
+actually committed), lands each extract in Bronze with
+`simulator.bronze.ingest_batch`, and advances a dataset's watermark only
+after Bronze returns `COMMITTED` or `ALREADY_COMMITTED`. Each dataset
+commits and advances on its own (Lead decision 4), so a failed dataset
+never blocks or rolls back another. It uses only the public APIs of
+`simulator.batch` (`DATASET_CATALOGUE`) and `simulator.bronze`
+(`ingest_batch`, `BronzeStore`, `load_bronze_config`).
+
+### CLI usage
+
+```
+python -m simulator.reference --output-dir simulator/_out/reference
+python -m simulator.batch --output-dir simulator/_out/batch
+python -m simulator.incremental --as-of 2025-01-06T12:00:00+10:00
+python -m simulator.incremental --as-of 2025-01-08T00:00:00Z --fixed-clock 2030-01-01T00:00:00Z
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--as-of ISO` | required | Extraction time. Must carry a UTC offset (`Z` or `+hh:mm`); normalised to UTC. |
+| `--config PATH` | `simulator/incremental/default_incremental.toml` | Alternate loader config. |
+| `--state-dir`, `--batch-source-dir`, `--reference-source-dir`, `--bronze-output-dir`, `--bronze-config` | config | Override the config paths. |
+| `--bad-source-policy strict\|preserve` | config (`strict`) | See "Bad source policy". |
+| `--late-arrival-policy fail\|record` | config (`fail`) | See "Watermark semantics". |
+| `--fixed-clock ISO` | wall clock | Virtual clock for reproducible runs: time stands still, and retry backoff advances it without sleeping. |
+| `--pipeline-run-id ID` | `ipr-<seq>-<as_of>` | Explicit pipeline run id. Refused if it already exists. |
+| `--log-file PATH` / `--log-level LEVEL` | stderr / `INFO` | JSON-lines logs, appended to. |
+
+Stdout gets one JSON summary line: `status`, `pipeline_run_id`, `as_of`,
+`summary` (the pipeline audit record, relative to the state dir),
+`late_rows_skipped`, `warnings`, and per dataset its `status`, `attempts`,
+`watermark_after`, `last_as_of_after`, `extracted_count`,
+`late_rows_skipped` and `error_type`.
+
+| Exit code | Pipeline status | Meaning |
+|---|---|---|
+| **0** | `SUCCEEDED` | Every dataset succeeded (including `SKIPPED_UNCHANGED` and `UP_TO_DATE`). |
+| **1** | `PARTIAL` / `FAILED` | At least one dataset failed; failed datasets keep their control state. |
+| **2** | `REFUSED` | Refused before anything was written: missing or naive `--as-of`, an `--as-of` earlier than a planned dataset's last committed `as_of` or later than the clock, invalid config, a reused `--pipeline-run-id`, or a control record of another schema version. |
+| **3** | `SUCCEEDED_WITH_WARNINGS` | Every dataset succeeded, **but** under `late_arrival_policy = "record"` late rows were skipped (or source rows vanished). Never 0: a scheduler must not treat skipped rows as a clean run. |
+
+The library entry point is
+`simulator.incremental.run_incremental_load(as_of, config=..., clock=...)`.
+
+### Load modes
+
+| Mode | Datasets | Source | Window | Extract |
+|---|---|---|---|---|
+| `full` | DE-01 reference entities `depots`, `stops`, `routes`, `vehicles` (each listed in config with `source_file` and `primary_key`) | `<entity>.json` JSON array in `reference_source_dir`, as written by `python -m simulator.reference` | The whole snapshot as of `as_of` | One canonical JSON line per element (sorted keys, compact). Every element must be an object with `schema_version`. If the snapshot is byte-identical to the last committed one, the run is `SKIPPED_UNCHANGED`: no Bronze run, `last_as_of` moved to `as_of`. Full datasets have no watermark (`null`). |
+| `incremental` | Every `DATASET_CATALOGUE` dataset | `<dataset>.jsonl` listed in the DE-04 `manifest.json` in `batch_source_dir` | `watermark < updated_at <= as_of`, where `watermark` = maximum committed `updated_at`; `updated_at <= as_of` while nothing is committed | The selected source lines, byte-for-byte, in source order. |
+
+Order is the config order (`[[incremental.datasets]]`), followed by every
+catalogue dataset the config doesn't list, in catalogue order
+(`include_unlisted_catalogue_datasets = true`). A new DE-04 dataset, such as
+DE-10's `vehicle_depot_assignments`, is therefore picked up with no config
+change. `exclude_datasets` skips catalogue datasets. The watermark column is
+always the catalogue's `watermark_column`. The order is processing order
+only (see FU-02 below).
+
+Every extract is a DE-04-shaped directory,
+`<state_dir>/extracts/<dataset>/<bronze_run_id>/`, holding `<dataset>.jsonl`
+plus a `manifest.json` with `row_count`, `sha256`, the primary key, the
+watermark/partition columns, the min/max watermark, the window and
+`preserved_bad_rows` (see "Bad source policy"). Bronze verifies the file
+against this manifest before it commits. Extracts are kept as the audit
+trail of exactly what was handed to Bronze.
+
+### Watermark semantics (max committed `updated_at`)
+
+Each incremental dataset has its own control record with two separate
+values:
+
+- **`watermark`**: the **maximum `updated_at` among the rows actually
+  committed to Bronze** for that dataset (`null` until a row is committed).
+  Invariant: every source row with `updated_at <= watermark` that was in
+  the source when it was extracted is in Bronze exactly once.
+- **`last_as_of`**: the `as_of` of the last committed run. It drives
+  idempotency and the refusal rules, never row selection.
+
+The window for a run is `watermark < updated_at <= as_of`
+(`updated_at <= as_of` while the watermark is `null`). After Bronze commits
+the window, `watermark` moves to the maximum `updated_at` the window
+contained, and `last_as_of` moves to `as_of`. A row whose `updated_at`
+equals a cut-off goes into the window ending at that cut-off, and never
+into the next one.
+
+**Why the maximum committed `updated_at` (Lead decision D1, after the QA
+FAIL of PR #17).** The first version persisted the window upper bound
+(`as_of`). DE-04 back-dates `updated_at` for `schedules` and
+`schedule_stop_times` (published `publish_lead_days` = 14 days before
+service) and for `vehicle_depot_assignments` (`notice_days` = 21). A DE-04
+source regenerated with more `service_days` therefore adds rows whose
+`updated_at` is *before* an `as_of` that was already loaded. QA's repro:
+load the 7-day default source at 2025-01-12, regenerate with
+`service_days = 10`, and run at 2025-01-16. The upper-bound watermark left
+510 schedules, 6,528 stop times and 3 assignments unloadable for good.
+DE-04 assigns `updated_at` per dataset monotonically in service date. For
+every dataset, the rows a regeneration adds have `updated_at` strictly
+greater than every existing row of *that* dataset. A per-dataset
+maximum-`updated_at` watermark therefore sees them. The regression test
+`test_qa_growth_repro_lands_every_row_at_realistic_cuts` is that exact
+scenario, plus a run at 2025-01-17, checked by an oracle computed only
+from the DE-04 files.
+
+**Run ids stay pure.** The Bronze run id is
+`inc-<dataset>-<watermark|initial>-<as_of>`. That is a pure function of
+(dataset, control state, `as_of`), so crash recovery is unchanged: a rerun
+with the same `as_of` rebuilds the identical extract under the identical
+run id (see "Idempotency").
+
+**Empty windows.** An empty window leaves `watermark` unchanged and moves
+`last_as_of` to `as_of`. It **still commits an empty Bronze run** under its
+own run id (the low stays the same and the `as_of` differs, so each empty
+window gets a distinct id). Reasons:
+
+- there is one commit-then-advance path, so one crash-recovery mechanism,
+  not two;
+- Bronze holds a record of every window the loader processed, so the §15
+  "watermark before/after" and the `last_as_of` advance are always backed by
+  a Bronze commit;
+- this matches a Data Factory Copy activity that copies 0 rows and still
+  logs a run.
+
+The cost is one empty Bronze manifest per dataset per idle run. A rerun of
+the same `as_of` is `UP_TO_DATE` (no Bronze call, control byte-identical).
+
+**`as_of` rules.** An `as_of` earlier than any planned dataset's
+`last_as_of` refuses the whole run before anything is written (no audit
+directory, no control or Bronze change). This holds even when `as_of` is
+later than that dataset's `watermark`: windows already processed are never
+re-cut. An `as_of` equal to `last_as_of` is a recorded `UP_TO_DATE` no-op.
+An `as_of` later than the clock is refused, because the loader cannot vouch
+for the completeness of the future.
+
+**Ties: the stated assumption.** Once a value has been committed as a
+dataset's watermark, the source never adds another row with that **same**
+`updated_at` (or any earlier one). A strict `>` window cannot see such a
+row. An inclusive `>=` window would re-extract every row at the watermark,
+which means duplicates. This is the standard high-watermark contract: the
+source assigns `updated_at` at commit time, monotonically.
+
+**Detection (late-arrival recount).** Each control record stores
+`source_rows_at_or_below_watermark`: the number of good source rows with
+`updated_at <= watermark` when that watermark was committed. Every later
+window recounts them in the current source. A positive delta means rows
+appeared at or behind the watermark, including a tie. A negative delta
+means rows vanished. Either way:
+
+- `late_arrival_policy = "fail"` (**default**): `LateArrivalError`; the
+  dataset fails with its control unchanged.
+- `late_arrival_policy = "record"`: the late rows are **not** extracted,
+  but this is never hidden (decision O1). The attempt audit record has
+  `late_rows_skipped` / `source_rows_vanished`. The control record keeps a
+  running `late_rows_skipped_total`. `pipeline.json` has a
+  `late_rows_skipped` total and a `warnings` list, and the run status is
+  `SUCCEEDED_WITH_WARNINGS` (CLI exit code 3). Skipped rows are reported
+  once, in the run that skipped them; the recount baseline is then reset.
+
+The check is count-based, so a row replaced by a different row with the
+same count is not detected. Tested: a tie appended at the watermark fails
+the dataset (`test_tie_at_the_watermark_appearing_after_commit_fails_loudly_by_default`),
+and a row strictly below the watermark fails it (`fail`) or is surfaced
+(`record`, exit 3).
+
+**Rows between `watermark` and `last_as_of` are recovered, not lost.** A
+row that appears after a run, with `watermark < updated_at <= last_as_of`,
+falls inside the next window, and the audit record counts it in
+`late_rows_recovered`. This is the growth case above. In production the
+usual extra margin is extracting at `now - safety lag`.
+
+**Keep the DE-04 config fixed across an incremental series.** Lead note
+from QA of PR #14 (DE-10): changing the DE-04 generator config, such as
+`[fleet_changes]`, or regenerating an `_out/batch` produced before DE-10,
+rewrites existing rows (for example `depot_id` on
+`schedules`/`historical_trips`) *without changing their `updated_at`*. An
+`updated_at` watermark cannot see such an in-place change, and a
+count-based check cannot see it either. Across a series, only
+`service_days` may grow; DE-04 guarantees growth is prefix-stable. To
+change anything else, reset the series: delete `<state_dir>/control/`, use
+a fresh Bronze store, then regenerate the source. Deleting only
+`control/` is not enough: it is refused (see "Idempotency"). The growth
+tests (`test_incremental_watermark.py`, `test_incremental_properties.py`)
+regenerate with an identical config apart from `service_days`.
+
+**Control schema.** Control records are `control_schema_version` 2.0.0.
+A 1.0.0 record (written by 9a7eac2, whose watermark was the window upper
+bound) is never reinterpreted. The run is refused before anything is
+written (`ControlSchemaError`, exit 2), and the message tells the operator
+to reset the series.
+
+### Bad source policy
+
+A source line is *bad* if it is not UTF-8, not JSON (including truncated or
+`NaN`), not a JSON object, or has duplicate keys. For `incremental` it is
+also bad if it has a missing or `null` `updated_at`, or one that is not an
+ISO-8601 string with an offset. For `full`, an element that is not an object
+or has no `schema_version` is bad. Bad lines are never skipped silently.
+
+| `bad_source_policy` | Behaviour |
+|---|---|
+| `strict` (**default**) | Any bad line fails the dataset before anything is landed. The watermark is unchanged; the audit record has `rejected_count` and `bad_source_rows_by_reason`. Bronze also runs with `parse_error_policy = "fail"`. Default because a broken source is a source incident to fix, not data to carry forward. |
+| `preserve` | Each bad line is landed **once**, byte-for-byte, in the next extract. Bronze runs with `parse_error_policy = "preserve"`, and lines are tracked by raw sha256 plus occurrence count in `preserved_bad_lines`. A line that is not UTF-8, not JSON, has duplicate keys or is not a JSON object becomes a Bronze parse-error record (`bronze_parse_error_records`). A JSON object with a missing, unparseable or naive (no offset) `updated_at` is well-formed to Bronze, so it **lands as a normal Bronze record**. Both kinds are counted in `bad_rows_preserved` and are part of the reconciliation identity, and both are **listed** (see below). |
+
+**Preserved rows are listed (Lead decision D2).** Under `preserve`, the
+attempt audit record and the extract `manifest.json`
+(`datasets.<dataset>.preserved_bad_rows`) both list every bad line the
+extract carries, in extract order. Each entry has:
+
+- `extract_line`: the 1-based line number within the extract file;
+- `source_line`: the line number in the source;
+- `reason`;
+- `sha256`: of the exact line bytes;
+- `bronze_outcome`: `bronze_parse_error_record` or
+  `stored_record_requires_quarantine`.
+
+The listing is deterministic: the same window produces the same list.
+**DE-12 must quarantine every row listed with
+`bronze_outcome = "stored_record_requires_quarantine"`.** Bronze has stored
+these rows as ordinary records, and only this listing (or DE-12's own
+strict validation of `updated_at`) tells them apart. `strict` stays the
+default.
+
+An empty source file, or an empty window, is a recorded success with 0
+rows. Bronze still commits an empty run (see "Watermark semantics").
+
+### Idempotency, crash safety and retries
+
+The Bronze run id is derived from (dataset, control state, `as_of`):
+`inc-<dataset>-<watermark|initial>-<as_of>` or `full-<dataset>-<as_of>`, with
+compact UTC timestamps such as `20250106T000000Z`. It is at most 121
+characters, within DE-05's run-id alphabet. This is designed around Bronze's
+actual semantics rather than against them: the same run id plus the same
+content is a no-op, and a committed run is never overwritten.
+
+| Situation | Behaviour |
+|---|---|
+| Rerun, same `as_of`, everything committed | Every dataset is `UP_TO_DATE`: no extract, no Bronze call, control byte-identical. |
+| Crash after the extract is written | Rerun rewrites the identical extract and Bronze commits the run (`COMMITTED`). |
+| Crash inside Bronze's commit (partitions published, no manifest) | Rerun: Bronze removes the orphans (`removed_uncommitted_paths`) and commits (`COMMITTED`). |
+| Crash after the Bronze commit, before the watermark write | Rerun: same run id and content, so Bronze returns `ALREADY_COMMITTED` and the watermark advances. |
+| Crash after the watermark write, before the audit record | Rerun: `UP_TO_DATE`. The crashed attempt has no audit record (see limitations). |
+| A *later* `as_of` after a crash past the Bronze commit (for example the scheduler's next trigger) | **Adopted, only if all of these hold:** (1) a control record exists for the dataset; (2) exactly one committed loader run is not listed in it, and that run is exactly the next window: its low equals the committed watermark, its high is after `last_as_of` and before `as_of`, and its run id is the one that window derives; (3) its extract on disk matches the Bronze run (sha256 and record count); (4) **re-selecting that window from the current source** gives the identical sha256 and count to what Bronze committed. Control then advances: `watermark` to the window's maximum `updated_at`, and `last_as_of` to its high (`recovered_bronze_run_id` in the audit record). The normal window up to `as_of` is then loaded. Nothing is re-extracted, so nothing is duplicated. |
+| Next-window run whose extract disagrees with Bronze, or whose window re-selected from the current source differs from what Bronze committed (an in-place source change) | Refused for that dataset with `ControlStateMismatchError` ("does not match its extract" / "does not match the current source"). Control is unchanged and nothing is landed. |
+| Unrecorded run that isn't the next window (extract missing, more than one, wrong low/high) | Refused with `ControlStateMismatchError`, because a different window would land overlapping rows. The message says to rerun with the interrupted run's `as_of` (the last part of its run id). If the other datasets have already moved past that `as_of`, the whole-pipeline rerun is refused, so rerun with a config listing only that dataset (tested). |
+| Control record lost or deleted (Bronze kept) | **Never adopted automatically.** Every dataset with committed loader runs fails with `ControlStateMismatchError` ("no control record exists"), and nothing is landed. QA's repro is tested: delete `control/`, regenerate DE-04 with `relief_pool_size = 5`, run a later `as_of`. Recovery is an operator action. If only one window was committed and the source is unchanged, rerun that window's `as_of` for that dataset alone: it returns `ALREADY_COMMITTED` and rebuilds the record (tested). Otherwise reset the series. The same applies to a *first* run interrupted after its Bronze commit and then run with a later `as_of`. |
+| Control lists a Bronze run Bronze doesn't have (Bronze store lost or replaced) | `ControlStateMismatchError`. |
+| Reference snapshot unchanged | `SKIPPED_UNCHANGED`: no Bronze run, so no `DuplicateInputError` and no duplicate rows. |
+| Reference snapshot changed, including back to an earlier version (A to B to A) | New `full-*` run. Full loads pass `allow_replay=True`, so Bronze accepts a revert to content it has seen before and flags it in `replay_of`. Incremental loads never allow replay: Bronze's content-hash guard stays a safety net against overlapping windows. |
+| Transient error (`TimeoutError`, `ConnectionError`, `simulator.incremental.TransientError`) | Retried up to `retry.max_attempts`, waiting `min(max_backoff_seconds, initial_backoff_seconds * backoff_multiplier ** (n - 1))` after failed attempt n on the injected clock. Every attempt is audited. When attempts run out, the dataset is `FAILED` with its watermark unchanged. |
+| Any other error (bad source, manifest mismatch, reconciliation, Bronze refusal) | Not retried. Dataset `FAILED`, watermark unchanged, the other datasets continue, and the pipeline is `PARTIAL`. A rerun with the same `as_of` processes only the failed dataset (the rest are `UP_TO_DATE`). |
+
+Rerunning after a partial failure ends with Bronze data, control records
+and extracts byte-identical to an uninterrupted run (fixed clock, relative
+paths). Bronze run manifests are identical too, **except** for a dataset
+that failed *inside* Bronze. Since DE-09, Bronze keeps the failed attempt,
+so that run's manifest gains a `previous_attempts` entry on the rerun, and
+lists the orphaned partitions it cleaned up in `removed_uncommitted_paths`
+(store-relative, path-free). Both
+cases are tested (`test_partial_failure_then_rerun_matches_an_uninterrupted_run_byte_for_byte`,
+`test_failure_inside_bronze_then_rerun_keeps_data_control_and_extracts_identical`).
+
+### Reconciliation identity
+
+Checked twice per attempt:
+
+```
+source_rows_in_window + bad_rows_preserved == extracted_count == bronze_records_written
+```
+
+`source_rows_in_window` is counted while scanning the source.
+`extracted_count` is re-counted from the extract file on disk, and its
+sha256 is compared with the selected lines. `bronze_records_written` comes
+from the Bronze run manifest. Under the default strict policy,
+`bad_rows_preserved` is 0. The first two terms are checked **before** Bronze
+is called, so a lossy extract never reaches Bronze; all three are checked
+before the watermark write. On failure the dataset is `FAILED`
+(`ReconciliationError`) and the watermark does not move. Bronze's own
+accounting identity (DE-05) continues the chain, and DE-12 will continue it
+into Silver.
+
+### Control and audit stores
+
+```
+<state_dir>/control/<dataset>.json                               watermark control record (atomic replace)
+<state_dir>/audit/<pipeline_run_id>/<dataset>/attempt-NNN.json   one immutable record per attempt
+<state_dir>/audit/<pipeline_run_id>/pipeline.json                immutable pipeline summary
+<state_dir>/extracts/<dataset>/<bronze_run_id>/                  extract handed to Bronze
+```
+
+Control record fields (`control_schema_version` 2.0.0): `dataset`, `mode`,
+`watermark_column`, `watermark_semantics` (`max_committed_updated_at`, or
+`none_full_snapshot` for full datasets), `watermark` (maximum committed
+`updated_at`; `null` for full datasets or before the first committed row),
+`last_as_of`, `last_window`, `last_bronze_run_id`,
+`committed_bronze_run_ids`, `rows_landed_total`, `last_extract_sha256`,
+`snapshot_sha256` (full), and for incremental datasets
+`source_rows_at_or_below_watermark` (the late-arrival recount baseline),
+`preserved_bad_lines` and `late_rows_skipped_total`.
+
+An audit record is written once: a temp file is hard-linked to its final
+name, which fails if the name already exists. It is never overwritten and
+never appended to. Every pipeline run gets a new directory: `ipr-<seq>-<as_of>`
+by default, and a reused id is refused. Attempt record fields (PROJECT.md
+section 15): `pipeline_run_id`, `dataset`, `mode`, `attempt`,
+`max_attempts`, `status` (`COMMITTED`, `ALREADY_COMMITTED`,
+`SKIPPED_UNCHANGED`, `UP_TO_DATE`, `FAILED`), `started_at`, `ended_at`,
+`duration_seconds`, `as_of`, `window_low`, `window_high`,
+`watermark_before`, `watermark_after`, `last_as_of_before`,
+`last_as_of_after`, `window_max_watermark`, `late_rows_recovered`,
+`late_rows_skipped`, `source_rows_vanished`, `watermark_semantics`,
+`bad_source_policy`, `source_file`, `source_sha256`,
+`source_manifest_check`, `source_rows_total`, `source_blank_lines`,
+`source_rows_in_window`, `source_rows_before_window`,
+`source_rows_after_window`, `bad_source_rows`,
+`bad_source_rows_by_reason`, `bad_rows_preserved`, `preserved_bad_rows`,
+`rejected_count`, `late_arrival_check`, `extract_dir`, `extract_sha256`,
+`extracted_count`, `bronze_run_id`, `bronze_status`, `bronze_manifest`,
+`bronze_records_written`, `bronze_parse_error_records`,
+`bronze_replay_of`, `recovered_bronze_run_id`, `reconciliation`, `error`
+(`type`, `message`, `retryable`, `will_retry`) and `next_backoff_seconds`
+(`audit_schema_version` 2.0.0). The pipeline summary holds the run status
+(`SUCCEEDED` / `SUCCEEDED_WITH_WARNINGS` / `PARTIAL` / `FAILED`), the
+policies, status counts, `late_rows_skipped` (total), `warnings` (one entry
+per dataset and type: `late_rows_skipped` or `source_rows_vanished`, with a
+count) and one result per dataset.
+
+**No absolute paths (FU-04).** Control and audit files only hold paths
+relative to the state dir (`extract_dir`) or the Bronze store
+(`bronze_manifest`), and source *file names*. Error messages are passed
+through a sanitiser that replaces the configured directories, the working
+directory and the home directory with `<state_dir>`, `<bronze_output_dir>`,
+`<cwd>`, `~` and so on. Tested with absolute configured paths and an
+injected error that quotes an absolute path. Since DE-09, Bronze run
+manifests written through the loader are path-free as well: `input_files[].path`
+is the extract file's basename, and error text, including a failed attempt
+carried in `previous_attempts`, is redacted. This is tested with absolute
+configured paths (`test_bronze_manifests_written_through_the_loader_are_path_free`).
+
+**Run id on every log line (FU-09 not repeated).** Every log line of the
+loader *and of Bronze while it is called by the loader* carries
+`pipeline_run_id`, plus `dataset` and `attempt` where they apply. This is
+done with a context logger adapter that is passed to Bronze. `--log-file`
+appends, so reused log files stay attributable by run id. Tested in-process
+and through the CLI.
+
+### FU-02 tolerance
+
+No cross-dataset ordering or referential check is imposed. A
+`historical_trips` row whose `updated_at` precedes that of the
+`service_disruptions` row it references is landed in its own (earlier)
+window like any other row. `event_date` is part of the byte-for-byte copied
+line and is never re-derived. Tested with a cut-off exactly at such a
+trip's `updated_at`.
+
+### Configuration: `simulator/incremental/default_incremental.toml`
+
+Validated by `simulator/incremental/config.py` (pydantic, unknown keys
+rejected). Keys: `state_dir`, `batch_source_dir`, `reference_source_dir`,
+`bronze_output_dir` (all under the gitignored `simulator/_out/`), optional
+`bronze_config`, `bad_source_policy`, `verify_source_manifest` (default
+`true`: compare each DE-04 file with its manifest before extracting; a
+mismatch fails the dataset), `source_manifest_file`, `late_arrival_policy`,
+`incremental_run_id_prefix` / `full_run_id_prefix`,
+`include_unlisted_catalogue_datasets`, `exclude_datasets`,
+`[incremental.retry]` (`max_attempts`, `initial_backoff_seconds`,
+`backoff_multiplier`, `max_backoff_seconds`) and `[[incremental.datasets]]`
+(`name`, `mode`, plus `source_file`/`primary_key` for `full`). The
+`parse_error_policy` of the Bronze config is overridden from
+`bad_source_policy`. No new dependency.
+
+### Mapping to Fabric
+
+Not implemented or connected. This is the intended translation once the
+Fabric trial is active (ADR-0004):
+
+| Local (DE-11) | Fabric equivalent |
+|---|---|
+| `run_incremental_load` over the plan | A Data Factory pipeline with a ForEach over a dataset list (Lookup on a config table), with sequential or batched concurrency. |
+| `control/<dataset>.json` | An `etl_watermark` control table (Warehouse table or Lakehouse Delta table), keyed by dataset, with `watermark` (max committed `updated_at`) and `last_as_of` columns. It is read by a Lookup activity and updated by a Stored procedure / Script activity *after* the Copy succeeds, setting `watermark = MAX(updated_at)` of the copied rows (unchanged when 0 rows). |
+| Window `watermark < updated_at <= as_of` | The Copy activity source query `WHERE updated_at > @{watermark} AND updated_at <= @{as_of}`, with `as_of` = trigger time or tumbling-window `windowEnd` (minus a safety lag). The classic high-watermark pattern. |
+| Late-arrival recount | A Lookup `SELECT COUNT(*) WHERE updated_at <= @{watermark}` compared with the stored baseline before the Copy. |
+| `full` + `SKIPPED_UNCHANGED` | A Copy activity for reference tables. Change detection via a Get Metadata (`contentMD5`) or a hash comparison before the copy. |
+| Extract directory + DE-04 manifest | Files landed in Lakehouse `Files/landing/<dataset>/<run id>/` before the Bronze notebook loads them. |
+| `ingest_batch` under a deterministic run id | The DE-05 Bronze notebook with `run_id` = `<dataset>-<window>` passed as a parameter; idempotent Delta append (`txnAppId`/`txnVersion`) or a pre-check against `bronze_run_audit`. |
+| Retry + backoff | Activity retry count and interval settings. Only transient failures are retried. |
+| Per-attempt audit records + `pipeline.json` | An `etl_run_audit` table written by a Script activity on success and failure paths, with the pipeline `RunId` as `pipeline_run_id`. |
+| `PARTIAL` + rerun only failed datasets | ForEach continues on failure. A rerun re-reads the watermarks, so finished datasets are no-ops. |
+| `ControlStateMismatchError` guard | A pre-copy Lookup comparing `etl_watermark` with `bronze_run_audit`. |
+
+### DE-11 tests
+
+`pytest simulator -q` includes (all expected counts recomputed from the
+source files and manifests, never hardcoded):
+
+- `test_incremental_config.py`: catalogue-driven plan and order,
+  exclusions, every validation error, backoff formula, deterministic and
+  valid Bronze run ids for worst-case names.
+- `test_incremental_load.py`: initial load, incremental window, full
+  reference load, DE-04-shaped extract verified by Bronze, **commit then
+  advance** (control observed at every stage), rerun no-op, empty window,
+  empty source, unchanged / changed / reverted reference snapshot, FU-02,
+  `as_of` offset normalisation.
+- `test_incremental_windows.py`: cut-off equal to an `updated_at` value,
+  an `as_of` before `last_as_of` refused with a byte-identical state and
+  Bronze tree, naive and future `as_of`, `UP_TO_DATE`.
+- `test_incremental_watermark.py` (D1): **QA's growth repro**, 7-day
+  default source at 2025-01-12, regenerated with 10 days, loaded at
+  2025-01-16 and 2025-01-17, with all 8 datasets checked against an oracle
+  from the DE-04 files. It fails on 9a7eac2. Also: three cut sequences with
+  growth between cuts at realistic cuts (exact values with a repeat,
+  beyond-horizon cuts with empty windows, day boundaries and between-value
+  cuts), checked after every cut; watermark = max committed `updated_at`
+  with `last_as_of` kept separately; empty-window semantics and
+  idempotency; an `as_of` between watermark and `last_as_of` refused; a
+  tie at the watermark detected; a row between watermark and `last_as_of`
+  recovered; a 1.0.0 control record refused.
+- `test_incremental_failures.py`: retries with backoff on the injected
+  clock, retry exhaustion, non-transient errors not retried, partial failure
+  then rerun byte-identical to an uninterrupted run, a failure *inside*
+  Bronze then rerun (only that run's manifest gains `previous_attempts`),
+  Bronze manifests path-free through the loader, strict and preserve
+  bad-source policies (including the D2 `preserved_bad_rows` listing in
+  the audit record and extract manifest), manifest mismatch, missing source,
+  both reconciliation checks, a late row failing the dataset (`fail`) or
+  surfaced as `SUCCEEDED_WITH_WARNINGS` with `late_rows_skipped` (`record`,
+  O1).
+- `test_incremental_crash.py`: four crash points x initial/incremental
+  window, each rerun matching an uninterrupted run (Bronze records, record
+  count, control bytes). Also: the same-`as_of` recovery path; adoption by
+  a later `as_of` matching an uninterrupted three-window run; adoption
+  refused when the current source no longer matches the committed window;
+  **QA's control-loss repro** (control deleted, DE-04 regenerated with
+  `relief_pool_size = 5`) refused for every dataset; an interrupted first
+  run refused at a later `as_of` and recovered by a single-dataset rerun;
+  a tampered or missing extract refused; a lost control record refused,
+  then rebuilt by its own `as_of` (one window) or refused (several
+  windows); a missing Bronze run.
+- `test_incremental_properties.py`: no loss / no duplicates after every
+  cut-off of five cut sequences (exact values with a repeat, between-value
+  cuts with empty windows, mixed, single load, day boundaries), each row in
+  the window containing its `updated_at`, and a source regenerated with
+  more `service_days` (same config otherwise) at cuts below the horizon.
+- `test_incremental_audit.py`: section 15 fields, the identity, records
+  never overwritten, one record per retry attempt, no absolute paths,
+  `pipeline_run_id` on every log record (loader and Bronze).
+- `test_incremental_cli.py`: two CLI processes byte-identical (state and
+  Bronze) with `--fixed-clock`, exit codes 0/1/2/3, config refusal, an
+  old control schema refused, the policy flag, an appended log file
+  attributable by run id.
+
+### Known limitations (DE-11)
+
+- **Not connected to Fabric** (see status above). Local filesystem only.
+- **Single writer.** One loader process per `state_dir` and Bronze store at
+  a time. There is no locking: two concurrent loaders could allocate the
+  same pipeline sequence or race on a control record. Concurrent writers are
+  out of scope.
+- **Monotonic `updated_at` assumed (ties).** A source row added later with
+  an `updated_at` at or below a dataset's committed watermark, including a
+  tie with it, is never extracted by a window. It is detected by the
+  count-based recount (fail by default, or surfaced with exit 3 under
+  `record`). A row *replaced* by another row with the same count, and
+  in-place changes that keep `updated_at`, are not detected at all. Keep
+  the DE-04 config fixed across a series (only `service_days` may grow).
+- **A hard crash leaves no audit record for that attempt.** Records are
+  written at the end of an attempt. The rerun's record (for example
+  `ALREADY_COMMITTED` or `UP_TO_DATE`) and Bronze's
+  `removed_uncommitted_paths` are the evidence of recovery.
+- **Automatic recovery covers one interrupted window, from an unchanged
+  source.** A crash past the Bronze commit is adopted by a later run only
+  with a control record present, its extract on disk matching Bronze, and
+  the window re-selected from the current source identical to what Bronze
+  committed. If the source changed inside that window in the meantime
+  (growth included), adoption is refused. A same-`as_of` rerun is then also
+  refused by Bronze (same run id, different content). The operator has to
+  restore the source the window was extracted from, or reset the series.
+  There is no repair command.
+- **Orphaned partitions after a crash inside Bronze's commit.** If the
+  crashed run id is retried (same `as_of`), Bronze removes its uncommitted
+  partition. If instead a later `as_of` recovers the dataset, the abandoned
+  run id is never retried, so its uncommitted partition stays on disk (QA
+  measured 460 extra lines next to 942 committed). Readers that go through
+  committed Bronze manifests never see it; anything downstream (DE-12
+  included) must read Bronze **only** through committed manifests, never by
+  globbing partition directories.
+- **A missing `--log-file` parent directory** produces a Python traceback
+  and exit 1, not a structured refusal (exit 2).
+- **Lost control is never rebuilt automatically.** Only a single-dataset
+  rerun of the window's own `as_of` (one committed window, unchanged
+  source) rebuilds it. Otherwise reset the series.
+- **Empty windows commit empty Bronze runs**: one empty Bronze manifest per
+  incremental dataset per idle run.
+- **Sources are read fully into memory**, which is fine at local scale.
+  Each attempt reads all Bronze manifests for the consistency guard (linear
+  in run count).
+- **Preserved bad lines are tracked by content.** A byte-identical bad line
+  that reappears beyond the number already landed is landed again.
+- **Fixed UTC offset / no daylight saving**, inherited from DE-04.

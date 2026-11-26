@@ -384,3 +384,8 @@ note prevents overclaiming, handover.
   that pass stage 1. Also document in the README that a COMMITTED Silver
   manifest with `reconciliation.holds=false` blocks all Gold runs
   (fail-closed). Source: QA of PR #12 (Q-b, O3).
+- **FU-12: Structured refusal for an unusable `--log-file`.** The DE-11
+  incremental CLI raises a Python traceback (exit 1) when the log file's
+  parent directory doesn't exist, instead of a structured refusal (exit 2).
+  Low priority; check the other CLIs for the same behaviour. Source: QA of
+  PR #17 (O-3).
