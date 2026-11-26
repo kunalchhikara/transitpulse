@@ -1546,6 +1546,21 @@ attribute it (DE-07 "Quarantine attribution").
   affect the few events after it.
 - A *backward* outlier (one event far in the past) never moves the
   watermark anyway; it is simply flagged `late`.
+- **A genuine jump followed by a long backlog is held back (QA of PR #16,
+  D4).** If the next `lookahead_events` valid events after a real forward
+  jump are all delayed pre-jump readings (e.g. a fleet reconnecting after an
+  outage and flushing its buffer), the jump looks uncorroborated and is held
+  back, so that backlog is not flagged `late` (QA: 106 late vs 294 with the
+  guard off, 197 flags differing). The held event still loads and normal
+  traffic resumes correctly afterwards. Raising `lookahead_events` narrows
+  this, at the buffering cost below.
+- **Buffering cost grows with rejects (QA of PR #16, D3).** While a
+  decision is pending, rejected and duplicate records are buffered too, and
+  each new record rescans the pending buffer, so the cost grows
+  quadratically with the number of rejects behind an open decision (QA: 60k
+  unparseable lines behind one outlier took 73 s vs 2.2 s with the guard
+  off). Fine at local scale; tracked as FU-13 before any large-volume run or
+  the Spark port.
 - Decisions are per Silver run (each run is a full snapshot); a Spark port
   needs a single-key stateful operator holding the pending buffer (see
   "Mapping to Fabric").
@@ -1864,7 +1879,8 @@ is active (ADR-0004):
   vehicles corroborate each other; an outlier with fewer than
   `min_contradicting_vehicles` vehicles after it (end of input,
   single-vehicle streams) is accepted; decisions wait for up to
-  `lookahead_events` later events (a bounded buffer).
+  `lookahead_events` later valid events (rejects in between are buffered
+  too; see FU-13).
 - **Resolved (FU-05): DE-03 duplicate injection used to replace the event it
   fired on**, so that event could be missing from the stream or first arrive
   later as a "replay". DE-03 now delivers each duplicate as an extra copy

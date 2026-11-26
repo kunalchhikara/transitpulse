@@ -22,7 +22,8 @@ usual, but it never advances the watermark) when, among the next
 
 Otherwise it advances the watermark exactly as without the guard. Because a
 decision may need later events, records are released in arrival order only
-once every earlier decision is final (a bounded lookahead buffer), so output
+once every earlier decision is final (a lookahead buffer: at most
+`lookahead_events` valid events, plus any interleaved rejects), so output
 order and every non-held event's flags are exactly those of the unguarded
 watermark run on the stream without the held-back events.
 
