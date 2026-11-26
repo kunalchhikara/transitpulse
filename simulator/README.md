@@ -12,11 +12,12 @@ Status: DE-01 (Synthetic Transport Domain Model & Schemas), DE-02
 Simulator), DE-04 (Synthetic Batch & Historical Datasets), DE-05 (Local
 Bronze Layer Ingestion Logic), DE-06 (Local Silver Layer for the telemetry
 stream), DE-07 (Local Gold Layer Groundwork - minimal route performance
-aggregate) and DE-11 (Incremental batch extraction with watermark control
-into Bronze) implemented, all local only (IMPLEMENTED - NOT CONNECTED).
-Remaining local work: Silver for the DE-04 batch datasets and the QA
-follow-ups (FU-01..FU-08) in `docs/BACKLOG.md`; the full PROJECT.md section
-10 dimensional model is the later Warehouse story.
+aggregate), DE-11 (Incremental batch extraction with watermark control
+into Bronze) and DE-12 (Batch Silver: validate, standardise, merge by
+primary key) implemented, all local only (IMPLEMENTED - NOT CONNECTED).
+Remaining local work: the QA follow-ups in `docs/BACKLOG.md`; the full
+PROJECT.md section 10 dimensional model is the later Warehouse story
+(DE-13), which reads the DE-12 current-state tables.
 
 ## Dependency choice: Pydantic
 
@@ -2448,3 +2449,503 @@ source files and manifests, never hardcoded):
 - **Preserved bad lines are tracked by content.** A byte-identical bad line
   that reappears beyond the number already landed is landed again.
 - **Fixed UTC offset / no daylight saving**, inherited from DE-04.
+
+## DE-12: Batch Silver — validate, standardise, merge by primary key
+
+**Status: IMPLEMENTED - NOT CONNECTED.** `simulator/silver_batch/` is local
+Python that reads the local DE-05 Bronze store (and, for lineage only, the
+DE-11 extract manifests) and writes a local batch-Silver store. No Fabric
+Lakehouse, OneLake, notebook or any other Azure/Fabric resource has been
+created, read or written, and nothing here is evidence of Fabric execution.
+"Mapping to Fabric" below records how it is meant to carry over.
+
+Batch Silver consumes **committed** Bronze batch runs, each applied **once**
+in Bronze commit order, for every `DATASET_CATALOGUE` dataset plus the four
+DE-01 reference entities DE-11 loads in `full` mode (`depots`, `stops`,
+`routes`, `vehicles`). It validates every row strictly against its DE-04 /
+DE-01 model *before* any merge decision, quarantines failures losslessly,
+merges valid rows into **current-state tables** keyed by the catalogue
+primary key with an explicit per-row outcome, counts unresolved foreign
+keys (FU-02) and asserts a per-dataset reconciliation before it commits.
+It is separate from DE-06's telemetry Silver (`simulator/silver/`) and
+imports only public pieces of `simulator.bronze`, `simulator.batch`,
+`simulator.schemas` (DE-05's `BronzeStore` primitives are reused for the
+commit protocol). No new dependency.
+
+### CLI usage
+
+```
+python -m simulator.reference --output-dir simulator/_out/reference
+python -m simulator.batch --output-dir simulator/_out/batch
+python -m simulator.incremental --as-of 2025-01-08T00:00:00Z --fixed-clock 2030-01-01T00:00:00Z
+python -m simulator.silver_batch --run-id sb-001 --fixed-processing-time 2030-01-01T00:00:00Z
+python -m simulator.incremental --as-of 2030-01-01T00:00:00Z --fixed-clock 2030-01-01T00:00:00Z
+python -m simulator.silver_batch --run-id sb-002 --fixed-processing-time 2030-01-01T00:00:00Z
+```
+
+(Run locally with the default config, sb-001 applied 12 Bronze runs, for
+example 1,190 schedules, 15,232 stop times and 4,790 telemetry snapshots,
+in about 1.3 s; sb-002 applied the 8 next windows. Every dataset reconciled
+and no FK was left unresolved.)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--run-id ID` | `sb-<utc>-<random>` | Batch-Silver run id (DE-05 run-id alphabet). Pass one for reproducible runs. |
+| `--bronze-dir`, `--output-dir`, `--incremental-state-dir` | config | Override the config paths. |
+| `--no-incremental-listing` | off | Do not read DE-11 extract manifests (strict validation still applies). |
+| `--bronze-run-id ID` (repeatable) | every pending run | Apply only these committed Bronze runs. They are still applied in Bronze commit order. An already-applied run is a recorded no-op. |
+| `--fixed-processing-time ISO` | wall clock | Fixed clock, for byte-reproducible output. |
+| `--config PATH` | `simulator/silver_batch/default_silver_batch.toml` | Alternate config. |
+| `--log-file PATH` / `--log-level` | stderr / `INFO` | JSON-lines logs, appended to. Every line carries `silver_batch_run_id` (FU-09 not repeated). |
+
+| Exit code | Meaning |
+|---|---|
+| **0** | `COMMITTED`, or `ALREADY_COMMITTED` (same run id and identical input). |
+| **1** | The run failed: a Bronze contract violation, a reconciliation failure or the snapshot-delete guard. Nothing is committed; a `FAILED` manifest records why. |
+| **2** | Refused before anything was written: an invalid run id, a run-id conflict, an unknown `--bronze-run-id`, an invalid config, an unusable `--log-file` (structured refusal, not a traceback; see FU-12), or an inconsistent batch-Silver store. |
+
+Stdout gets one JSON summary line: `status`, `run_id`, `commit_sequence`,
+`base_run_id`, `manifest`, `bronze_runs_applied`,
+`bronze_runs_skipped_already_applied`, the per-dataset outcome counts and
+`reconciliation_holds`. The library entry point is
+`simulator.silver_batch.run_silver_batch(run_id=..., config=..., clock=...)`.
+
+### Input: committed Bronze runs only
+
+- **Read contract (criterion 1).** Bronze is read **only** through
+  committed run manifests (`BronzeStore.committed_manifests()`, `mode =
+  "batch"`), and each data file is located through
+  `tables[<table>].path`. Nothing is found by globbing partition
+  directories. After a DE-11 crash that was recovered at a later `as_of`, an
+  abandoned run's uncommitted partition can remain on disk (QA of PR #17,
+  O-1). It is never seen. Each file is checked against its manifest before
+  any row is used: sha256, line count = `records_written`, `run_id` on every
+  record, and increasing `_bronze_line_number`. A mismatch fails the run
+  (`BronzeContractError`). Stream runs (DE-06 input) and `FAILED` runs are
+  ignored. A batch table that is not a batch-Silver dataset is listed in
+  `ignored_tables`, never dropped silently.
+- **Order.** Pending runs are applied in Bronze commit order:
+  `ingestion_time`, then `run_id`. Under a fixed clock, every DE-11 run has
+  the same `ingestion_time`, so the run id decides. A later window such as
+  `inc-x-20250106T...` can then sort before `inc-x-initial-...`. This is
+  safe because the merge is guarded by `updated_at` (see below). The same
+  guard makes it safe to apply runs out of order with `--bronze-run-id`
+  (tested).
+- **DE-11 lineage (Lead decision D2).** For a Bronze run whose id has a DE-11
+  prefix (`inc-` / `full-`, configurable), the extract manifest
+  `<incremental_state_dir>/extracts/<dataset>/<run_id>/manifest.json` **must**
+  be found. It is matched to the Bronze run by run id **and** by the sha256
+  of the file Bronze ingested. Its `preserved_bad_rows` are mapped to Bronze
+  records by `extract_line` = `_bronze_line_number`. A missing, mismatched or
+  inconsistent listing fails the run. Examples: a listed line Bronze does not
+  hold, or a `bronze_outcome` that disagrees with the Bronze record. For a
+  full snapshot, `window.high` (the DE-11 `as_of`) becomes the snapshot's
+  `as_of`.
+
+### Checkpoint model
+
+Every committed manifest carries a `commit_sequence` (the base's + 1), its
+`base_run_id`, and a cumulative `checkpoint`:
+
+- `applied_bronze_run_ids`;
+- per dataset, the current-state table's `path`, `sha256`, `rows` (active),
+  `tombstones`, `version_run_id`, `mode`, `primary_key` and
+  `last_snapshot_as_of`.
+
+The **head** is the committed manifest with the highest `commit_sequence`.
+A run starts from the head, and "pending" means a committed Bronze batch run
+not in the head's `applied_bronze_run_ids`. Re-applying an applied run is a
+no-op: it is reported in `bronze_runs_skipped_already_applied`, and the
+tables and checkpoint are unchanged (tested). There is no separate pointer
+file that could disagree with the manifests. Two committed manifests that
+claim the same sequence (a single-writer violation) refuse every run
+(`SilverBatchStateError`).
+
+### Validation and standardisation (rule catalogue)
+
+Validate-then-merge, as DE-06: an invalid row never claims a primary key.
+Precedence is table order. Every failing rule found is recorded in
+`rejection_rules`, and the first one is `primary_rule`.
+
+| # | Rule id | Category | Check |
+|---|---|---|---|
+| 0 | `bronze_parse_error` | parse | Bronze could not store the line as a JSON object (DE-05 parse-error record). The raw bytes are kept. |
+| 1 | `supported_schema_version` | schema | `schema_version` is a string the dataset's contract supports: DE-04 `BATCH_SCHEMA_VERSION`, DE-01 `ENTITY_SCHEMA_VERSION`, or the telemetry `SUPPORTED_SCHEMA_VERSIONS` for `historical_telemetry`. Short-circuits. |
+| 2 | `missing_field` | schema | Every model field is **present**, including fields the model gives a default (`schema_version`, `snapshot_type`, `vehicle_type`, `assigned_route_id`). Defaults are a producer convenience, not a consumer contract. |
+| 3 | `unknown_field` | schema | No field outside the model (`extra="forbid"`). |
+| 4 | `wrong_type` | schema | Strict JSON types via `model_validate_json(<exact original text>, strict=True)`. No coercion: `"4"` is not an int, `true` is not an int, an epoch number is not a timestamp, `null` is not a timestamp, and a datetime is not an `event_date`. |
+| 5 | `invalid_enum` | schema | Enum fields hold a model value. |
+| 6 | `timestamp_without_offset` | schema | Every timestamp carries a UTC offset. This includes `historical_telemetry` `event_time`/`generated_at`, which DE-01's `TelemetryEvent` would accept naive. Silver never guesses a zone. |
+| 7 | `value_out_of_range` | schema | Model bounds (`ge`/`gt`/`le`/`lt`, `min_length`). |
+| 8 | `model_constraint` | schema | Cross-field model validators: arrival after departure, a TRIP scope needs `trip_id`, an INITIAL assignment has no previous depot, and so on. |
+| 9 | `non_finite_number` | schema | Floats are finite (`1e400` overflows to inf). |
+| 10 | `blank_primary_key` | schema | Primary-key strings are not blank. |
+| 11 | `schema_conformance` | schema | Any other strict-model failure (fallback). Example: a lone surrogate escape, which pydantic's parser rejects. |
+| 12 | `preserved_bad_source_row` | source | DE-11 listed the row in `preserved_bad_rows`. **Every row listed with `bronze_outcome = stored_record_requires_quarantine` is quarantined**, even one the model would accept. |
+| 13 | `merge_conflict` | merge | Same key and same `updated_at` as the current row, but a different payload. |
+| 14 | `duplicate_key_in_snapshot` | merge | The key repeats within one full snapshot. The first occurrence wins. |
+
+Counters by category: `quarantined == parse_errors + schema_failures +
+source_flagged + merge_quarantined == sum(quarantined_by_rule)`.
+`rule_violations` counts every rule hit.
+
+**Standardisation** of a valid row: the model fields in model order;
+timestamps as UTC ISO-8601 with microseconds and `Z` (the instant never
+changes); enums as their value; floats and ints as validated.
+**`event_date` is passed through unchanged.** It is the *local* service
+date, never re-derived from a UTC timestamp (FU-02). The comparison is on
+this standardised payload, so the same instant written as `+10:00` is
+`unchanged`. `_silver_row_hash` is the sha256 of the canonical standardised
+payload.
+
+`historical_telemetry` gets **DE-04 model validation only**. The PROJECT.md
+section 12 telemetry rules (DE-06: maximum speed, known route, future-time
+tolerance and so on) are **not** applied. A 500 km/h snapshot loads, and
+this is tested and recorded as a limitation.
+
+### Quarantine record (lossless)
+
+`quarantine_<dataset>/run_id=<id>/part-00000.jsonl`, one line per rejected
+Bronze record: `silver_batch_run_id`, `processing_time`, `dataset`,
+`ingestion_time`, `source`, `bronze_run_id`, `_bronze_source_file`,
+`_bronze_line_number`, `primary_rule`, `rejection_category`,
+`rejection_rules`, `rejections` (rule, category, reason with the offending
+value), `primary_key` (when extractable), `de11_preserved_bad_row` (the
+listing entry, or null) and `conflict_with` (`merge_conflict` only). Then
+the raw payload, exactly as in DE-06:
+
+| `raw_format` | `raw_payload` | `raw_payload_text` / `raw_encoding` |
+|---|---|---|
+| `json_object` | The original object (Bronze metadata stripped). It is null, with `raw_payload_omitted_reasons`, for `non_finite_number` / `unpaired_surrogate`. | The **exact original text**, recovered from the Bronze line and verified, `utf-8`. |
+| `bronze_parse_error` | null | Bronze's raw line, `utf-8`, or `base64` for bytes that are not UTF-8. Also `bronze_parse_error` / `bronze_parse_error_detail`. |
+
+The original input bytes are always recoverable (tested for every DE-05
+parse-error code, invalid UTF-8 included).
+
+### Merge outcomes (merge mode: every DE-04 catalogue dataset)
+
+Each valid row is compared with the current row that has the same catalogue
+primary key. Rows earlier in the same run count as current.
+
+| Outcome | Condition | Effect | Audit |
+|---|---|---|---|
+| `inserted` | Key not present | Row added | Lineage on the row |
+| `updated` | Incoming `updated_at` is newer | Row replaced | Lineage on the row |
+| `unchanged` | Same `updated_at`, same standardised payload | Nothing; the existing row and its lineage are kept | Counted |
+| `stale` | Incoming `updated_at` is older | **Excluded** | `stale_<dataset>` with `stale_reason = older_updated_at`, the payload, and the current row's `updated_at`, hash and Bronze run |
+| `conflict` | Same `updated_at`, different payload | **Quarantined** (`merge_conflict`); the current row is kept | Quarantine record with `conflict_with` |
+
+Because of the `updated_at` guard, the final state does not depend on the
+order Bronze runs are applied in. The exception is a conflict, where the
+row applied first is kept and the second is quarantined. Conflicts are a
+source defect, and both payloads stay auditable.
+
+### Snapshot semantics and deletion policy (the four reference entities)
+
+Each DE-11 `full` Bronze run is a **complete snapshot**. Valid rows are
+taken first occurrence per key; a repeated key is quarantined as
+`duplicate_key_in_snapshot`. These rows become the current state:
+
+- `inserted`: a new key, or a previously deleted one (reactivated);
+- `updated`: the standardised payload changed;
+- `unchanged`: the payload is the same;
+- `deleted`: an active key absent from the valid snapshot.
+
+**Deletion policy: soft delete.** A deleted key **stays in the table as a
+tombstone**, with `_silver_is_deleted = true` and
+`_silver_deleted_by_run_id`. Historical facts (trips, assignments) can
+still reference a retired vehicle, depot, route or stop, and DE-13 needs
+that row for its dimensions. `read_current_table` hides tombstones unless
+`include_deleted=True`. A key returning in a later snapshot is reactivated
+(counted as `inserted`, e.g. DE-11's A to B to A revert).
+
+Two more rules:
+
+- A key whose snapshot row was **quarantined** is absent from the valid
+  snapshot, so it is deleted. This is counted separately in
+  `deleted_with_quarantined_row`, so the current state always equals the
+  last valid snapshot.
+- **Guard:** a valid snapshot that would soft-delete more than
+  `max_snapshot_delete_fraction` (default 0.5) of the active rows fails the
+  run (`SnapshotDeleteGuardError`, nothing committed). A truncated or empty
+  file is far likelier than a real mass deletion. Set it to 1.0 to allow
+  the deletion deliberately (tested).
+
+A snapshot **older** than the last one applied for that dataset is `stale`
+**as a whole**. "Older" is measured by DE-11 `as_of`, or by Bronze
+`ingestion_time` for a non-DE-11 run. Its valid rows are counted and written
+to `stale_<dataset>` with `stale_reason = older_snapshot`, and nothing
+changes. So applying snapshots out of order never regresses the reference
+data.
+
+### FU-02: unresolved references and `event_date`
+
+A row whose foreign key points at a parent that is not loaded yet **still
+loads**. Foreign keys come from the DE-04 catalogue; for the reference
+entities they are `routes.home_depot_id`, `routes.stop_ids` (a list, checked
+per element), `vehicles.home_depot_id` and `vehicles.assigned_route_id`.
+They are counted per FK, with names such as
+`disruption_id->service_disruptions.disruption_id`:
+
+- `datasets.<ds>.unresolved_references`: among the rows this run inserted
+  or updated;
+- `referential_integrity.<ds>`: over the whole active table after the run.
+  It drops to 0 once the parents arrive (tested with a trip that DE-11
+  extracted before its disruption, and with a parent that never arrives).
+
+A null in a nullable FK is not a reference. A parent counts as loaded if any
+row of the parent table, tombstones included, holds the key. No
+cross-dataset ordering is imposed. `event_date` is never re-derived (see
+Standardisation): tested for every row of every dataset, including trips
+whose UTC departure date is the previous day.
+
+### Reconciliation identity (asserted per dataset before commit)
+
+The checks use independently obtained numbers: counters incremented at
+classification, the Bronze manifests' record counts, row counts of the
+in-memory state, and lines **re-counted in the files written to staging**
+(or carried forward):
+
+```
+extracted   == inserted + updated + unchanged + stale + quarantined          (PROJECT.md section 15; per Bronze table run too)
+extracted   == sum(records_written of the Bronze table runs applied)          (continues DE-05 -> DE-11 chain)
+quarantined == parse_errors + schema_failures + source_flagged + merge_quarantined == sum(quarantined_by_rule)
+conflicts   == quarantined_by_rule[merge_conflict]
+merge:    rows_after == rows_before + inserted ; tombstones_after == 0
+snapshot: rows_after == rows_before + inserted - deleted ; rows_after == valid keys of the last applied snapshot
+lines on disk: current table == rows_after + tombstones_after ; quarantine == quarantined ; stale == stale
+DE-11: listed rows == listed rows quarantined ; listed stored_record_requires_quarantine == those quarantined
+```
+
+Every check is recorded in `reconciliation.checks` (dataset, check, left,
+right, holds). Any failure raises `SilverBatchAccountingError`. In that case
+nothing is published, staging is removed, the head is unchanged, and a
+`FAILED` manifest names the failed checks (tested by corrupting a staged
+file). Together with DE-05 and DE-11 this gives the chain: source rows in
+the window → extract → Bronze `records_written` → `extracted` → five
+outcomes.
+
+### Idempotency and reruns
+
+| Situation | Behaviour |
+|---|---|
+| Same run id, same input, committed | `ALREADY_COMMITTED`; nothing is written (byte-identical even under a later clock). The input is checked against **what that run applied**: its base commit, its Bronze runs and their sha256, the config and the selection. Later Silver commits, and Bronze runs committed after it, do not turn a retry of a finished run into a conflict. |
+| Same run id, different input (another config, another `--bronze-run-id` selection, or a Bronze run it applied that now holds other content) | Refused: `SilverBatchRunIdConflictError` (exit 2). Nothing is written. |
+| Same run id after a `FAILED` attempt | Retried from scratch from the current head. Every failed attempt is kept in `previous_attempts` (status, times, base, fingerprint, error). |
+| Crash (process death) after partitions were published, before the manifest | Nothing is visible: head and readers go through committed manifests. The retry removes the orphaned partitions (`removed_uncommitted_paths`). Its tables and manifest equal an uninterrupted run's, apart from that field (tested). |
+| New run id, nothing pending | Commits a run that applies nothing. The checkpoint and table versions are carried forward. |
+
+Fixed clock → byte-identical tables and manifests, in-process and across two
+CLI processes, and across different absolute roots (tested). **No absolute
+paths (FU-04):** table and Bronze paths are relative to their roots, store
+roots are never recorded, and error messages pass through a redactor
+(`<output_dir>`, `<bronze_dir>`, `<incremental_state_dir>`, `<cwd>`, `~`).
+Tested: no tmp root, home directory or username in any manifest.
+
+### Output layout and manifest
+
+```
+<output_dir>/                                        (default simulator/_out/silver_batch, gitignored)
+  current_<dataset>/run_id=<id>/part-00000.jsonl     full current-state table as of run <id>, sorted by PK
+                                                     (only written when the table changed; else carried forward)
+  quarantine_<dataset>/run_id=<id>/part-00000.jsonl  rows rejected by run <id> (only when > 0)
+  stale_<dataset>/run_id=<id>/part-00000.jsonl       rows excluded as stale by run <id> (only when > 0)
+  _runs/<id>.json                                    run manifest: audit record AND commit marker
+  _staging/<id>/...                                  in-flight run, never read, removed on finish
+```
+
+Current-state row = the model fields (standardised, model order), then
+`_silver_row_hash`, `_silver_is_deleted` and the lineage columns
+`_silver_deleted_by_run_id`, `_silver_batch_run_id`,
+`_silver_processing_time`, `_bronze_run_id`, `_bronze_ingestion_time`,
+`_bronze_source`, `_bronze_source_file` and `_bronze_line_number`. The
+lineage columns describe the run and Bronze record that last changed the
+row.
+
+Manifest (`_runs/<id>.json`, sorted keys, `silver_batch_manifest_version`
+1.0.0): `run_id`, `status`, `commit_sequence`, `base_run_id`,
+`processing_time`, `started_at`, `ended_at`, `duration_seconds`,
+`input_fingerprint`, `previous_attempts`, `bronze_selection`,
+`bronze_runs_applied` (per table run: path, sha256, records, `de11_extract`
+status/listing counts, snapshot `as_of`/staleness, counters and
+`rows_after`), `bronze_runs_skipped_already_applied`, `config`,
+`rule_catalogue`, `datasets` (per touched dataset: mode, key, watermark
+column, `rows_before`/`rows_after`, `tombstones_before`/`tombstones_after`,
+counters, `quality_percentage`, `unresolved_references`, table entries),
+`referential_integrity`, `totals`, `reconciliation`, `checkpoint`,
+`removed_uncommitted_paths` and `error`.
+
+### DE-13 hand-off: what to read and how
+
+Current-state tables (all are `current_<dataset>`):
+
+| Dataset | Mode | Primary key | Warehouse use (ADR-0006) |
+|---|---|---|---|
+| `depots` | snapshot | `depot_id` | `dim_depot` |
+| `stops` | snapshot | `stop_id` | `dim_stop` |
+| `routes` | snapshot | `route_id` | `dim_route` |
+| `vehicles` | snapshot | `vehicle_id` | `dim_vehicle` Type 1 attributes |
+| `vehicle_depot_assignments` | merge | `assignment_id` | `dim_vehicle` SCD2 depot history (effective-dated change log; local `event_date`) |
+| `schedules` | merge | `trip_id` | `fact_trip` planned measures |
+| `schedule_stop_times` | merge | (`trip_id`, `stop_sequence`) | stop-level punctuality |
+| `historical_trips` | merge | `trip_id` | `fact_trip` |
+| `service_disruptions` | merge | `disruption_id` | `fact_service_incident` (DE-14) |
+| `historical_telemetry` | merge | `event_id` | (deferred: `fact_vehicle_telemetry`) |
+| `passenger_journeys` | merge | `journey_id` | (deferred: `fact_passenger_journey`) |
+| `weather_observations` | merge | `observation_id` | optional context |
+
+How DE-13 reads them:
+
+- **Only through committed batch-Silver manifests.** Use
+  `simulator.silver_batch.read_current_table(output_dir, dataset,
+  run_id=<pinned id>)`. It reads the committed manifest (default: the head,
+  `head_manifest(output_dir)`) and takes `checkpoint.tables[dataset]`. It
+  verifies sha256 and row counts and returns rows sorted by primary key,
+  without tombstones unless `include_deleted=True`. Never glob
+  `current_*/`: older versions and crash leftovers live there.
+- Pin a `run_id` per Warehouse load and record it, so a load is
+  reproducible and the next load can diff two checkpoints. Compare
+  `checkpoint.tables[ds].version_run_id`, or `_silver_row_hash` per key.
+- Check `referential_integrity` in the pinned manifest before loading
+  facts; on fully loaded data every count is 0. Unknown-member (`-1`)
+  lookups apply when it is not 0.
+- `event_date` is the local service date and the SCD2 effective-dating key.
+  Do not re-derive it from UTC timestamps.
+
+### Configuration: `simulator/silver_batch/default_silver_batch.toml`
+
+Validated by `simulator/silver_batch/config.py` (pydantic, unknown keys
+rejected). The keys are:
+
+- `output_dir`, `bronze_dir` and `incremental_state_dir`, all under the
+  gitignored `simulator/_out/`;
+- `incremental_run_id_prefixes` (`["inc-", "full-"]`);
+- `max_snapshot_delete_fraction` (0.5);
+- `max_logged_rejections` (100), a cap on per-row warning log lines. Every
+  rejection is still counted and written.
+
+Dataset contracts are not configured here: they come from
+`DATASET_CATALOGUE` and the DE-01 models. Paths are excluded from the input
+fingerprint.
+
+### Mapping to Fabric
+
+Not implemented or connected. This is the intended translation once the
+Fabric trial is active (ADR-0004). Every row is unverified until it has run
+on Fabric with evidence:
+
+| Local (DE-12) | Fabric equivalent |
+|---|---|
+| Read committed Bronze runs via manifests | Read the Bronze Delta tables (only committed transactions are visible). Select pending runs with `WHERE run_id NOT IN (SELECT run_id FROM silver_batch_applied_runs)`, or incrementally with Delta change data feed. |
+| Checkpoint (`applied_bronze_run_ids`, head manifest) | A `silver_batch_applied_runs` Delta table plus `silver_batch_run_audit`, written in the same notebook run after the MERGEs succeed. |
+| Strict model validation + rule ids | `from_json` with an explicit schema (`mode` PERMISSIVE + `columnNameOfCorruptRecord`), then one boolean column per rule and an array of failed rule ids, in a PySpark notebook. |
+| Merge by PK with `updated_at` guard | `MERGE INTO silver_<ds> t USING (deduplicated batch) s ON t.<pk> = s.<pk> WHEN MATCHED AND s.updated_at > t.updated_at THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *`. Stale rows (`s.updated_at < t.updated_at`) and conflicts (equal `updated_at`, different `row_hash`) are split out before the MERGE into `silver_<ds>_stale` and `silver_<ds>_quarantine`. Within-batch duplicates are reduced first with `row_number()` over the PK ordered by `updated_at`, Bronze run and line. |
+| Snapshot reference tables + soft delete | `MERGE ... WHEN NOT MATCHED BY SOURCE THEN UPDATE SET _silver_is_deleted = true` (Delta Lake 2.3+ / Fabric runtime), behind the delete-fraction guard (a pre-MERGE count). |
+| Quarantine / stale JSONL | `silver_<ds>_quarantine` / `silver_<ds>_stale` Delta tables, appended in the same job. |
+| Reconciliation assert + manifest | A `silver_batch_run_audit` Delta table (one row per dataset per run, with the counters and `holds`). The notebook raises before the MERGE commit if an identity fails. |
+| Staging + rename + manifest commit marker | The Delta transaction per table, with `txnAppId`/`txnVersion` = Silver run id for idempotent reruns. Cross-table atomicity is not native in Delta: the audit row is written last, and readers pin the audit row (as DE-13 pins `run_id` here). |
+| `read_current_table(run_id=...)` | Delta time travel (`VERSION AS OF` recorded in the audit row). The Warehouse loads read the Lakehouse SQL analytics endpoint. |
+
+### DE-12 tests
+
+`pytest simulator -q` includes 105 batch-Silver tests:
+
+- `test_silver_batch_merge.py`: one test per outcome (`inserted`,
+  `updated`, `unchanged` including an offset re-spelling, `stale` audited,
+  `conflict` quarantined); outcomes within one run follow line order;
+  validate-before-merge; runs applied out of order (by ingestion time and by
+  explicit selection) converge to the in-order state; re-applying an
+  applied run is a no-op; an unknown explicit run is refused.
+- `test_silver_batch_quarantine.py`: every rule id has a named test case
+  (20 strict-model cases); `non_finite_number` and lone-surrogate fallback
+  keep the exact text; all failing fields in precedence order; every DE-05
+  parse-error code with raw bytes recovered (base64 for invalid UTF-8);
+  byte-exact stored text. **A real DE-11 `preserve` run** lands bad
+  `historical_trips` lines: missing, null, naive, invalid and non-string
+  `updated_at`, plus a truncated line. It also lands a `vehicles` element
+  without `schema_version`. Every listed row is quarantined with
+  `preserved_bad_source_row`. A listing alone forces quarantine of a row
+  the model accepts. Inconsistent DE-11 lineage fails the run.
+- `test_silver_batch_reference.py`: each of the four reference entities
+  gets an initial snapshot and a changed snapshot (updated / deleted /
+  inserted / unchanged, soft delete). Also: an A-B-A revert reactivates;
+  an older snapshot is stale as a whole; a duplicate key in a snapshot; a
+  quarantined row's key is deleted and counted; the delete guard; the
+  `routes.stop_ids` list FK.
+- `test_silver_batch_datasets.py`: the registry equals the catalogue plus
+  the reference entities. Every catalogue dataset goes through one path,
+  checked against the DE-04 files. `event_date` is never re-derived. FU-02
+  is checked with a trip loaded before its disruption, resolved by a later
+  run, and with a parent that never arrives. There are dedicated tests for
+  `historical_trips`, `service_disruptions` and
+  `vehicle_depot_assignments`, and one for the `historical_telemetry`
+  limitation.
+- `test_silver_batch_reconciliation.py`: the identity against counts
+  derived from row tags set at construction, per dataset and per Bronze
+  table run, with record-level lineage coverage. A staged file whose lines
+  disagree with the counters fails with nothing committed. The Bronze read
+  contract is covered: an orphan uncommitted partition, a FAILED Bronze run
+  and a stream run are not read, a tampered partition fails, and an unknown
+  batch table is recorded.
+- `test_silver_batch_equivalence.py` (criterion 7): k DE-11 windows, with
+  Silver run once or after every window, equal one load at the final
+  `as_of` (lineage columns excluded) for three cut sequences. The sequences
+  are exact values, between-value cuts with empty windows, and day
+  boundaries. A **growth** case regenerates DE-04 with more `service_days`
+  (config otherwise identical) between windows.
+- `test_silver_batch_idempotency.py`: an `ALREADY_COMMITTED` no-op is
+  byte-identical. A retry of a committed run ignores later Bronze runs.
+  Changed config, selection or Bronze content is refused. Failed attempts
+  are kept in `previous_attempts`. A crash after publish, then a retry,
+  equals an uninterrupted run. Output is byte-identical across absolute
+  roots. No paths, home or username appear in manifests. The run id is on
+  every log record.
+- `test_silver_batch_cli.py`: the DE-11 CLI and batch-Silver CLI chain in
+  separate OS processes is byte-identical across two roots. Exit codes
+  0/1/2 are covered, including a missing log directory. Log lines are
+  appended and attributable by run id.
+
+Mutation check: each of these was introduced and reverted, and each made
+tests fail.
+
+- Treating `stale` as `updated`: 5 tests.
+- Dropping the preserved-bad-row quarantine: 2 tests, and the reconciliation
+  check itself fails the run.
+- Treating `conflict` as `unchanged`: 2 tests.
+- Never deleting from snapshots: 7 tests.
+- Ignoring the checkpoint: 11 tests.
+
+### Known limitations (DE-12)
+
+- **Not connected to Fabric** (see status above). Local filesystem only.
+- **`historical_telemetry`: DE-04 model validation only.** The PROJECT.md
+  section 12 telemetry rules from DE-06 are not applied to historical
+  snapshots: maximum speed and occupancy thresholds, known route,
+  future-time tolerance and Sydney bounds. Valid-but-implausible values
+  load.
+- **Single writer per batch-Silver store** (no locking). Two concurrent
+  runs could claim the same `commit_sequence`. This is detected on the next
+  run, which then refuses.
+- **Full table rewrite per change.** A changed table is rewritten in full
+  per run (copy-on-write versions). Old versions are kept, with no vacuum
+  or retention. Inputs and tables are held in memory, which is fine at
+  local scale (default config: about 1.3 s per run).
+- **Conflict winner depends on application order.** For two different
+  payloads with the same key and `updated_at`, the row applied first is
+  kept and the later one is quarantined. Both are auditable.
+- **A quarantined snapshot row deletes its key** (snapshot = valid
+  snapshot). This is bounded by the delete guard and counted in
+  `deleted_with_quarantined_row`.
+- **DE-11 listing lookup needs the DE-11 state dir.** A Bronze run with a
+  DE-11 run-id prefix fails if its extract manifest cannot be found.
+  `--no-incremental-listing` disables the lookup; strict validation alone
+  still quarantines every bad-`updated_at` and missing-`schema_version` row
+  DE-11 can produce.
+- **In-place source changes are not detectable here either.** The DE-11
+  runbook note applies: keep the DE-04 generator config fixed across an
+  incremental series (only `service_days` may grow), or reset the series
+  (DE-11 control, Bronze **and** this store).
+- **Orphaned partitions of a crashed run id** stay on disk until that run id
+  is retried. Readers never see them.
+- Timestamps are standardised to microseconds (sub-microsecond digits are
+  truncated by Python's datetime). There is no daylight saving (DE-04).
