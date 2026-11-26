@@ -1,0 +1,29 @@
+# Default DE-12 batch Silver configuration (simulator/silver_batch/config.py).
+# Every operational knob lives here, per PROJECT.md section 19. Relative paths
+# resolve against the current working directory (like DE-04/05/06/11).
+
+[silver_batch]
+# Root of the local batch-Silver store (current-state tables, quarantine and
+# stale audit tables, run manifests). Under the gitignored simulator/_out/.
+output_dir = "simulator/_out/silver_batch"
+# Root of the DE-05 Bronze store read (only through committed run manifests).
+bronze_dir = "simulator/_out/bronze"
+# DE-11 loader state directory. Batch Silver reads ONLY the extract manifests
+# under <incremental_state_dir>/extracts/<dataset>/<bronze_run_id>/ to obtain
+# the `preserved_bad_rows` listing (Lead decision D2): every row listed with
+# bronze_outcome = "stored_record_requires_quarantine" is quarantined.
+# Comment out to disable the lookup (strict model validation still applies).
+incremental_state_dir = "simulator/_out/incremental"
+# Bronze run-id prefixes that identify DE-11 loader runs (DE-11
+# `incremental_run_id_prefix` / `full_run_id_prefix` + "-"). When
+# incremental_state_dir is set, the extract manifest of such a run MUST be
+# found and must match the Bronze run, or the Silver run fails (the listing
+# is never silently skipped).
+incremental_run_id_prefixes = ["inc-", "full-"]
+# Snapshot (full-load) safety guard: a valid reference snapshot that would
+# soft-delete more than this fraction of a table's active rows fails the run
+# (nothing committed). 1.0 disables the guard.
+max_snapshot_delete_fraction = 0.5
+# Cap on per-record WARNING log lines per run (every rejection is still
+# counted in the manifest and written to the quarantine table).
+max_logged_rejections = 100
