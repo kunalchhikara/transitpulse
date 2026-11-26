@@ -2205,7 +2205,9 @@ Rerunning after a partial failure ends with Bronze data, control records
 and extracts byte-identical to an uninterrupted run (fixed clock, relative
 paths). Bronze run manifests are identical too, **except** for a dataset
 that failed *inside* Bronze. Since DE-09, Bronze keeps the failed attempt,
-so that run's manifest gains a `previous_attempts` entry on the rerun. Both
+so that run's manifest gains a `previous_attempts` entry on the rerun, and
+lists the orphaned partitions it cleaned up in `removed_uncommitted_paths`
+(store-relative, path-free). Both
 cases are tested (`test_partial_failure_then_rerun_matches_an_uninterrupted_run_byte_for_byte`,
 `test_failure_inside_bronze_then_rerun_keeps_data_control_and_extracts_identical`).
 
@@ -2425,6 +2427,16 @@ source files and manifests, never hardcoded):
   refused by Bronze (same run id, different content). The operator has to
   restore the source the window was extracted from, or reset the series.
   There is no repair command.
+- **Orphaned partitions after a crash inside Bronze's commit.** If the
+  crashed run id is retried (same `as_of`), Bronze removes its uncommitted
+  partition. If instead a later `as_of` recovers the dataset, the abandoned
+  run id is never retried, so its uncommitted partition stays on disk (QA
+  measured 460 extra lines next to 942 committed). Readers that go through
+  committed Bronze manifests never see it; anything downstream (DE-12
+  included) must read Bronze **only** through committed manifests, never by
+  globbing partition directories.
+- **A missing `--log-file` parent directory** produces a Python traceback
+  and exit 1, not a structured refusal (exit 2).
 - **Lost control is never rebuilt automatically.** Only a single-dataset
   rerun of the window's own `as_of` (one committed window, unchanged
   source) rebuilds it. Otherwise reset the series.
